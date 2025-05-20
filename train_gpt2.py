@@ -263,7 +263,7 @@ class DataLoaderLite:
         self.B = batch_size
         self.T = block_size
         self.num_batches = len(tokens) // (batch_size * block_size)
-
+        print(f"1 epoch = : {self.num_batches} batches")
         # state
         self.current_position = 0
     
@@ -280,6 +280,8 @@ class DataLoaderLite:
     
 # -------------------------------------------------------
 # Test the model
+
+import time
 
 
 if torch.cuda.is_available():
@@ -300,8 +302,9 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 # initialize the dataloader
-train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=4, block_size=32)
-
+train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=4, block_size=1024)
+# set tf32
+torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained('gpt2')
 # print("model weight loading successful, you didn't crash")
@@ -313,7 +316,8 @@ model.to(device)
 # training loop
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-for i in range(50):
+for i in range(500):
+    t0 = time.time()
     # getting a batch of data
     x, y = train_loader.next_batch()
     x = x.to(device)
@@ -323,7 +327,11 @@ for i in range(50):
     logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
     loss.backward() # set gradients
     optimizer.step() # update the weights
-    print(f"Step {i+1} done loss: {loss.item()}")
+    torch.cuda.synchronize() # wait till GPU is done with all the works
+    t1 = time.time()
+    dt = (t1 - t0)*1000
+    tokens_per_second = (train_loader.B * train_loader.T) / dt
+    print(f"Step {i} loss: {loss.item()} dt {dt:2f}ms, {tokens_per_second:.2f} tokens/sec")
 
 import sys
 sys.exit(0)

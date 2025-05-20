@@ -203,22 +203,67 @@ class GPT(nn.Module):
         return idx
 # Test the model
 
-model = GPT.from_pretrained('gpt2')
-print("model weight loading successful, you didn't crash")
+if torch.cuda.is_available():
+    print("CUDA is available, using GPU")
+    device = 'cuda'
+elif torch.backends.mps.is_available():
+    print("MPS is available, using GPU")
+    device = 'mps'
+else:
+    print("No GPU available, using CPU")
+    device = 'cpu'
+
+# #testing on cpu
+# device = 'cpu'
+
+# loading the data file
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+with open('tiny_shakespeare.txt', 'r') as f:
+    text = f.read()
+    f.close()
+
+data = text[:1000]
+print(data[:100])
+
+tokens = enc.encode(data) # (T,)
+
+# getting a batch of data
+B, T = 4, 32
+buff = torch.tensor(tokens[:B*T+1], dtype=torch.long) # (B*T+1,)
+x = buff[:-1].view(B, T) # (B, T)
+y = buff[1:].view(B, T) # (B, T)    
+x.to(device)
+y.to(device)
+
+
+# model = GPT.from_pretrained('gpt2')
+# print("model weight loading successful, you didn't crash")
+
+
+model = GPT(GPTConfig())
+print('creating random model')
+model.to(device)
+logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
+
+print(f"Input shape: {x.shape}, Output shape: {logits.shape}")
+loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+import sys
+sys.exit(0)
+
+#### Doing sampling on the model
 
 max_return_sequences = 5
 max_length = 30
 
 model.eval()
-model.to('cuda')
+model.to(device)
 
-# prefix tokens
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello I am a language model,")
+
+tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(max_return_sequences,1) # (5,8)
-x = tokens.to('cuda')
+x = tokens.to(device)
 print(f"Input tokens: {tokens}")
 
 # generate new tokens: currently x is (B=5, T=8)

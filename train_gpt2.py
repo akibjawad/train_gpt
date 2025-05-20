@@ -64,15 +64,18 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,T,C) -> (B,T,nh,hs) -> (B,nh,T,hs)
         # this way n_head is like a batch dimension, making sure n_heads are computed in parallel
 
-
         # attention mask is the (B, nh, T, T) tensor
-        att = (q @ k.transpose(-2, -1)) * (1.0 / (math.sqrt(k.size(-1)))) # (B,nh,T,hs) @ (B,nh,hs,T) -> (B,nh,T,T)
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B,nh,T,T) -> (B,nh,T,T)
-        att = F.softmax(att, dim=-1)
-        y = (att @ v) # (B,nh,T,T) @ (B,nh,T,hs) -> (B,nh,T,hs)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / (math.sqrt(k.size(-1)))) # (B,nh,T,hs) @ (B,nh,hs,T) -> (B,nh,T,T)
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B,nh,T,T) -> (B,nh,T,T)
+        # att = F.softmax(att, dim=-1)
+        # y = (att @ v) # (B,nh,T,T) @ (B,nh,T,hs) -> (B,nh,T,hs)
+
+        # use flassh attention instead of the regular attention calculation
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
+
+        # reassmble the heads back into the embedding dimension
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         # (B,nh,T,hs) -> (B,T,nh*hs) -> (B,T,C)
-        # reassble the heads back into the embedding dimension
 
         y = self.c_proj(y) # (B,T,C) -> (B,T,C)
         return y
@@ -302,7 +305,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 # initialize the dataloader
-train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=4, block_size=1024)
+train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=12, block_size=1024)
 # set tf32
 torch.set_float32_matmul_precision('high')
 

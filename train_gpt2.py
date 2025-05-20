@@ -318,7 +318,9 @@ model.to(device)
 model = torch.compile(model)
 
 # training loop
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# hyperparameters tuning
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
 
 for i in range(50):
     t0 = time.time()
@@ -334,12 +336,16 @@ for i in range(50):
         # softmax, loss, and other operations are in float32
         logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
     loss.backward() # set gradients
+
+    # clip the gradients so model doesn't get a shock with large gradients
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
     optimizer.step() # update the weights
     torch.cuda.synchronize() # wait till GPU is done with all the works
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_per_second = (train_loader.B * train_loader.T) / dt
-    print(f"Step {i} loss: {loss.item():.6f} dt {dt:.2f}ms, {tokens_per_second:.2f} tokens/sec")
+    print(f"Step {i} | loss: {loss.item():.6f} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
 
 import sys
 sys.exit(0)

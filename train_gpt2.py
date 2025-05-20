@@ -312,11 +312,12 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig())
 print('creating random model')
 model.to(device)
+model = torch.compile(model)
 
 # training loop
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-for i in range(500):
+for i in range(50):
     t0 = time.time()
     # getting a batch of data
     x, y = train_loader.next_batch()
@@ -324,14 +325,18 @@ for i in range(500):
     y = y.to(device)
     # print(f"Input shape: {x.shape}, Output shape: {y.shape}")
     optimizer.zero_grad()
-    logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        # parameters are still in float32 but logits are in bfloat16
+        # only the matrix multiplications are in bfloat16
+        # softmax, loss, and other operations are in float32
+        logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
     loss.backward() # set gradients
     optimizer.step() # update the weights
     torch.cuda.synchronize() # wait till GPU is done with all the works
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_per_second = (train_loader.B * train_loader.T) / dt
-    print(f"Step {i} loss: {loss.item()} dt {dt:2f}ms, {tokens_per_second:.2f} tokens/sec")
+    print(f"Step {i} loss: {loss.item():.6f} dt {dt:.2f}ms, {tokens_per_second:.2f} tokens/sec")
 
 import sys
 sys.exit(0)

@@ -311,8 +311,8 @@ torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained('gpt2')
 # print("model weight loading successful, you didn't crash")
-
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) # simply overriding 50257 to 50304 so that pytorch handles the vocab size better
+# model = GPT(GPTConfig())
 print('creating random model')
 model.to(device)
 model = torch.compile(model)

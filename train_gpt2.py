@@ -10,6 +10,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.act = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0
         # self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
@@ -28,6 +29,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0
         # for regularization
         self.n_head = config.n_head
         self.n_embed = config.n_embd
@@ -86,6 +88,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
+        # from the gpt2 paper: 
+        # "We scale the weights of the residual layers at initialization by 1/sqrt(N) where N is the number of residual layers in the block"
+        # to implement this follw the flag NANOGPT_SCALE in c_proj (last layer of each block)
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -113,6 +118,39 @@ class GPT(nn.Module):
             ln_f=nn.LayerNorm(config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        # same data is used for both lm_head and wte
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # initialize the weights to follow the gpt2 implementation done by openai
+        # apply the init_weights function to all modules in the model
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # if the module has the NANOGPT_SCALE_INIT attribute, use it to scale the weights
+                # 2 comes from 2 types of layers (mlp and attn)
+                # this is where we follow the quote from the gpt2 paper
+                # "We scale the weights of the residual layers at initialization by 1/sqrt(N) where N is the number of residual layers in the block"
+                # to implement this follow the flag NANOGPT_SCALE in c_proj (last layer of each block)
+
+                std *= (2*self.config.n_layer) ** -0.5 # 2 comes from 2 types of layers (mlp and attn)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        # layerNorm is not initialized explicitly, it is initialized by default from pytorch to be mean=0, std=1
+        # elif isinstance(module, nn.LayerNorm):
+        #     module.bias.data.zero_()
+        #     module.weight.data.fill_(1.0)
+        # elif isinstance(module, CausalSelfAttention):
+        #     # initialize the attention weights
+        #     module.c_attn.weight.data.normal_(mean=0.0, std=0.02)
+        #     module.c_proj.weight.data.normal_(mean=0.0, std=0.02)
 
 
     @classmethod
@@ -164,7 +202,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.shape
         assert T <= self.config.block_size, f"Cannot forward, model block size is {self.config.block_size}, but input sequence length is {T}"
         # forward the token and position embeddings
@@ -183,15 +221,24 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         # get the logits
+        loss = None
         logits = self.lm_head(x)
         # (B, T, n_embd) -> (B, T, vocab_size)
-        return logits
+        if targets is not None:
+            # calculate the loss
+            # (B, T, vocab_size) -> (B*T, vocab_size)
+            logits = logits.view(-1, logits.size(-1))
+            # (B, T) -> (B*T)
+            targets = targets.view(-1)
+            # calculate the loss
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
     
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) tensor of input tokens
         for _ in range(max_new_tokens):
             # get the logits
-            logits = self(idx)
+            logits, _ = self(idx)
             # get the last token
             logits = logits[:, -1, :]
             # apply softmax to get the probabilities
@@ -201,7 +248,39 @@ class GPT(nn.Module):
             # append the new token to the input
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+
+# -------------------------------------------------------
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self, datafile, batch_size, block_size):
+        with open(datafile, 'r') as f:
+            data = f.read()
+            f.close()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(data)
+        self.tokens = torch.tensor(tokens, dtype=torch.long)
+        self.B = batch_size
+        self.T = block_size
+        self.num_batches = len(tokens) // (batch_size * block_size)
+
+        # state
+        self.current_position = 0
+    
+    def next_batch(self):
+        # you can move those to gpu later when required
+        buff = self.tokens[self.current_position : self.current_position + self.B * self.T +1] # (B*T+1,)
+        x = buff[:-1].view(self.B, self.T)
+        y = buff[1:].view(self.B, self.T)
+        self.current_position += self.B * self.T
+
+        if self.current_position + (self.B * self.T + 1) > self.tokens.size(0):
+            self.current_position = 0
+        return x, y
+    
+# -------------------------------------------------------
 # Test the model
+
 
 if torch.cuda.is_available():
     print("CUDA is available, using GPU")
@@ -216,38 +295,36 @@ else:
 # #testing on cpu
 # device = 'cpu'
 
-# loading the data file
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-with open('tiny_shakespeare.txt', 'r') as f:
-    text = f.read()
-    f.close()
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
-data = text[:1000]
-print(data[:100])
-
-tokens = enc.encode(data) # (T,)
-
-# getting a batch of data
-B, T = 4, 32
-buff = torch.tensor(tokens[:B*T+1], dtype=torch.long) # (B*T+1,)
-x = buff[:-1].view(B, T) # (B, T)
-y = buff[1:].view(B, T) # (B, T)    
-x.to(device)
-y.to(device)
+# initialize the dataloader
+train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=4, block_size=32)
 
 
 # model = GPT.from_pretrained('gpt2')
 # print("model weight loading successful, you didn't crash")
 
-
 model = GPT(GPTConfig())
 print('creating random model')
 model.to(device)
-logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
 
-print(f"Input shape: {x.shape}, Output shape: {logits.shape}")
-loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+# training loop
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+for i in range(50):
+    # getting a batch of data
+    x, y = train_loader.next_batch()
+    x = x.to(device)
+    y = y.to(device)
+    # print(f"Input shape: {x.shape}, Output shape: {y.shape}")
+    optimizer.zero_grad()
+    logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
+    loss.backward() # set gradients
+    optimizer.step() # update the weights
+    print(f"Step {i+1} done loss: {loss.item()}")
+
 import sys
 sys.exit(0)
 

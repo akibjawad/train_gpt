@@ -322,7 +322,27 @@ model = torch.compile(model)
 # hyperparameters tuning
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
 
-for i in range(50):
+# lerning rate schedule, linear warmup and cosine decay to a minimum
+max_lr = 6e-4 #following gpt3 paper
+min_lr = max_lr * 0.1 # 10% of max_lr
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(step):
+    # 1) linear warmup for warmup_steps
+    if step < warmup_steps:
+        return max_lr * (step+1) / warmup_steps # step is 0-indexed
+    # 2) if step > max_steps, return min_lr
+    if step > max_steps:
+        return min_lr
+    # originally in the gpt3 paper, before they start decaying the used 0.1 * max_lr
+    # 3) decay the learning rate using cosine schedule
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio)) # coeff starting from 1 to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+for step in range(max_steps):
     t0 = time.time()
     # getting a batch of data
     x, y = train_loader.next_batch()
@@ -340,12 +360,17 @@ for i in range(50):
     # clip the gradients so model doesn't get a shock with large gradients
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
+    # detect and set the learning rate before applying the update
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step() # update the weights
     torch.cuda.synchronize() # wait till GPU is done with all the works
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_per_second = (train_loader.B * train_loader.T) / dt
-    print(f"Step {i} | loss: {loss.item():.6f} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
+    print(f"Step {step} | loss: {loss.item():.6f} | lr:{lr:0.6f} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
 
 import sys
 sys.exit(0)

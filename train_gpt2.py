@@ -331,8 +331,7 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-# initialize the dataloader
-train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=12, block_size=1024)
+
 # set tf32
 torch.set_float32_matmul_precision('high')
 
@@ -370,21 +369,43 @@ def get_lr(step):
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
 
+# gradient accumulation: 
+# you don't have the resources to train in 1 large batch of total_batch_size
+# so you split the batch into B*T and accumulate the gradients with doing forward and backward pass and not updating the weights
+# once you do accumulation_steps passes, you update the weights
+
+# total_batch_size = 12*1024 # experiment matching previous result with 12 batch size
+# B = 4 # experiment matching previous result with 12 batch size
+
+total_batch_size = 524288 # 2**19, ~0.5M tokens (from the paper gpt3)
+B = 16
+T = 1024
+assert total_batch_size % (B * T) == 0, f"total_batch_size {total_batch_size} is not divisible by B*T {B*T}"
+accumulation_steps = total_batch_size // (B * T)
+print(f"total_batch_size: {total_batch_size}, B*T: {B*T}, accumulation_steps: {accumulation_steps}")
+
+# initialize the dataloader
+train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=B, block_size=T)
 
 for step in range(max_steps):
     t0 = time.time()
-    # getting a batch of data
-    x, y = train_loader.next_batch()
-    x = x.to(device)
-    y = y.to(device)
-    # print(f"Input shape: {x.shape}, Output shape: {y.shape}")
-    optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        # parameters are still in float32 but logits are in bfloat16
-        # only the matrix multiplications are in bfloat16
-        # softmax, loss, and other operations are in float32
-        logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
-    loss.backward() # set gradients
+    loss_accum = 0.0
+    for micro_steps in range(accumulation_steps):
+        # getting a batch of data
+        x, y = train_loader.next_batch()
+        x = x.to(device)
+        y = y.to(device)
+        # print(f"Input shape: {x.shape}, Output shape: {y.shape}")
+        optimizer.zero_grad()
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            # parameters are still in float32 but logits are in bfloat16
+            # only the matrix multiplications are in bfloat16
+            # softmax, loss, and other operations are in float32
+            logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
+        loss = loss / accumulation_steps # scale the loss by the number of accumulation steps
+        loss_accum += loss.detach() # accumulate the loss
+        loss.backward() # set gradients
+
 
     # clip the gradients so model doesn't get a shock with large gradients
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -398,8 +419,10 @@ for step in range(max_steps):
     torch.cuda.synchronize() # wait till GPU is done with all the works
     t1 = time.time()
     dt = (t1 - t0)*1000
-    tokens_per_second = (train_loader.B * train_loader.T) / dt
-    print(f"Step {step} | loss: {loss.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
+    tokens_processed = (B * T) * accumulation_steps
+    tokens_per_second = tokens_processed / dt
+    # tokens_per_second = (train_loader.B * train_loader.T) / dt
+    print(f"Step {step} | loss: {loss_accum.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
 
 import sys
 sys.exit(0)

@@ -377,7 +377,7 @@ if torch.cuda.is_available():
 # B = 4 # experiment matching previous result with 12 batch size
 
 total_batch_size = 524288 # 2**19, ~0.5M tokens (from the paper gpt3)
-B = 64 # micro batch size
+B = 16 # micro batch size
 T = 1024 # context length/ block size
 # adjusting for the multi-process training
 assert total_batch_size % (B * T * ddp_world_size) == 0, f"total_batch_size {total_batch_size} is not divisible by B*T*ddp_word_size {B*T*ddp_world_size}"
@@ -408,7 +408,7 @@ model = GPT(GPTConfig(vocab_size=50304)) # simply overriding 50257 to 50304 so t
 print('creating random model')
 model.to(device)
 # disabling compile for now
-# model = torch.compile(model)
+model = torch.compile(model)
 # wrap the model with DDP
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -416,6 +416,8 @@ if ddp:
     # Once the loss.backward() is done, it will call allreduce(), the gradients are averaged across all processes
     # and the averaged gradients will be provided to each process
     # to update the weights
+# create a raw model to get the optimizer
+raw_model = model.module if ddp else model
     
 
 # learning rate schedule, linear warmup and cosine decay to a minimum
@@ -441,7 +443,7 @@ def get_lr(step):
 # training loop
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 # hyperparameters tuning
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
 
 for step in range(max_steps):

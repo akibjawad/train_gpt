@@ -311,18 +311,47 @@ class DataLoaderLite:
 # -------------------------------------------------------
 # Test the model
 
+# --------- running multi GPU training loop --------------
+import os
 import time
 
+from torch.distributed import init_process_group, destroy_process_group
 
-if torch.cuda.is_available():
-    print("CUDA is available, using GPU")
-    device = 'cuda'
-elif torch.backends.mps.is_available():
-    print("MPS is available, using GPU")
-    device = 'mps'
+# setup the DDP(Distributed Data Parallel) process group
+# torchrun command sets the env varraible RANK, LOCAL_RANK, WORLD_SIZE
+# with torchrun command you will create multiple processes, all the processes will be running the same script
+# Hence all code below this line will be multi-threaded/multi-process
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp process?
+if ddp:
+    print("Running in DDP mode")
+    assert torch.cuda.is_available(), "CUDA is not available, but DDP requires it"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    # print(f"ddp_rank: {ddp_rank}, ddp_local_rank: {ddp_local_rank}, ddp_world_size: {ddp_world_size}")
+    # set the device to the local rank
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # This process will do logging and checkpointing etc
 else:
-    print("No GPU available, using CPU")
-    device = 'cpu'
+    print("Running in single GPU mode")
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # set the device appropriately
+    if torch.cuda.is_available():
+        print("CUDA is available, using GPU")
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        print("MPS is available, using GPU")
+        device = 'mps'
+    else:
+        print("No GPU available, using CPU")
+        device = 'cpu'
+    print(f"Using device {device} for training")
+
 
 # #testing on cpu
 # device = 'cpu'
@@ -330,6 +359,32 @@ else:
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
+
+# gradient accumulation: 
+# you don't have the resources to train in 1 large batch of total_batch_size
+# so you split the batch into B*T and accumulate the gradients with doing forward and backward pass and not updating the weights
+# once you do accumulation_steps passes, you update the weights
+
+# total_batch_size = 12*1024 # experiment matching previous result with 12 batch size
+# B = 4 # experiment matching previous result with 12 batch size
+
+total_batch_size = 524288 # 2**19, ~0.5M tokens (from the paper gpt3)
+B = 64 # micro batch size
+T = 1024 # context length/ block size
+# adjusting for the multi-process training
+assert total_batch_size % (B * T * ddp_world_size) == 0, f"total_batch_size {total_batch_size} is not divisible by B*T*ddp_word_size {B*T*ddp_world_size}"
+accumulation_steps = total_batch_size // (B * T * ddp_world_size)
+# all 8 process will print this line, instead make sure only the master process prints it
+if master_process:
+    print(f"total_batch_size: {total_batch_size}, accumulation_steps: {accumulation_steps}")
+
+# test multiple GPUs
+print(f"I am process {ddp_rank} of {ddp_world_size} processes running on {device}")
+
+import sys; sys.exit(0) # for the test running
+
+# initialize the dataloader
+train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=B, block_size=T)
 
 
 # set tf32
@@ -368,24 +423,6 @@ def get_lr(step):
 # hyperparameters tuning
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
-
-# gradient accumulation: 
-# you don't have the resources to train in 1 large batch of total_batch_size
-# so you split the batch into B*T and accumulate the gradients with doing forward and backward pass and not updating the weights
-# once you do accumulation_steps passes, you update the weights
-
-# total_batch_size = 12*1024 # experiment matching previous result with 12 batch size
-# B = 4 # experiment matching previous result with 12 batch size
-
-total_batch_size = 524288 # 2**19, ~0.5M tokens (from the paper gpt3)
-B = 16
-T = 1024
-assert total_batch_size % (B * T) == 0, f"total_batch_size {total_batch_size} is not divisible by B*T {B*T}"
-accumulation_steps = total_batch_size // (B * T)
-print(f"total_batch_size: {total_batch_size}, B*T: {B*T}, accumulation_steps: {accumulation_steps}")
-
-# initialize the dataloader
-train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=B, block_size=T)
 
 for step in range(max_steps):
     t0 = time.time()

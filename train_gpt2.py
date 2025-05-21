@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import inspect
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -251,6 +252,32 @@ class GPT(nn.Module):
             # append the new token to the input
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+    
+    def configure_optimizers(self, weight_decay=0.1, learning_rate=6e-4, device='cpu'):
+        # configure the optimizer 
+        # find parameters that should decay weights (requires_grad and dim>=2) and those should not decay weights (not requires_grad)
+        param_dict = {pn:p for pn, p in self.named_parameters()}
+        param_dict = {pn:p for pn, p in param_dict.items() if p.requires_grad}
+        # create a optim_groups. Any parameter that is 2D or more will be in the decay group, else in the no decay group
+        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+        no_decay_params = [p for _, p in param_dict.items() if p.dim() < 2] # bias and layernorm, etc
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum([p.numel() for p in decay_params])
+        num_no_decay_params = sum([p.numel() for p in no_decay_params])
+        print(f'num decay param tensors: {len(decay_params)}, with num decay parameters: {num_decay_params}')
+        print(f'num no decay param tensors: {len(no_decay_params)}, with num no decay parameters: {num_no_decay_params}')
+        
+        # check if fused adamw is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"Using fused adamw: {use_fused}")
+        # use AdamW with weight decay
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        
+        return optimizer
 
 # -------------------------------------------------------
 import tiktoken
@@ -317,11 +344,6 @@ print('creating random model')
 model.to(device)
 model = torch.compile(model)
 
-# training loop
-# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-# hyperparameters tuning
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
-
 # lerning rate schedule, linear warmup and cosine decay to a minimum
 max_lr = 6e-4 #following gpt3 paper
 min_lr = max_lr * 0.1 # 10% of max_lr
@@ -332,7 +354,7 @@ def get_lr(step):
     # 1) linear warmup for warmup_steps
     if step < warmup_steps:
         return max_lr * (step+1) / warmup_steps # step is 0-indexed
-    # 2) if step > max_steps, return min_lr
+    # 2) if step > lr_decay_iters, return min_lr
     if step > max_steps:
         return min_lr
     # originally in the gpt3 paper, before they start decaying the used 0.1 * max_lr
@@ -341,6 +363,13 @@ def get_lr(step):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio)) # coeff starting from 1 to 0
     return min_lr + coeff * (max_lr - min_lr)
+
+# training loop
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# hyperparameters tuning
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
+
 
 for step in range(max_steps):
     t0 = time.time()
@@ -370,7 +399,7 @@ for step in range(max_steps):
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_per_second = (train_loader.B * train_loader.T) / dt
-    print(f"Step {step} | loss: {loss.item():.6f} | lr:{lr:0.6f} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
+    print(f"Step {step} | loss: {loss.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
 
 import sys
 sys.exit(0)

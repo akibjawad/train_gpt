@@ -283,7 +283,7 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, datafile, batch_size, block_size):
+    def __init__(self, datafile, batch_size, block_size, process_rank=0, process_world_size=1):
         with open(datafile, 'r') as f:
             data = f.read()
             f.close()
@@ -292,20 +292,25 @@ class DataLoaderLite:
         self.tokens = torch.tensor(tokens, dtype=torch.long)
         self.B = batch_size
         self.T = block_size
-        self.num_batches = len(tokens) // (batch_size * block_size)
-        print(f"1 epoch = : {self.num_batches} batches")
+        self.process_rank = process_rank
+        self.num_processes = process_world_size
+        # self.num_batches = len(tokens) // (batch_size * block_size)
+        # print(f"1 epoch = : {self.num_batches} batches")
         # state
         self.current_position = 0
+        self.current_position = self.B * self.T * process_rank
     
     def next_batch(self):
         # you can move those to gpu later when required
         buff = self.tokens[self.current_position : self.current_position + self.B * self.T +1] # (B*T+1,)
         x = buff[:-1].view(self.B, self.T)
         y = buff[1:].view(self.B, self.T)
-        self.current_position += self.B * self.T
+        self.current_position += self.B * self.T * self.num_processes
 
-        if self.current_position + (self.B * self.T + 1) > self.tokens.size(0):
-            self.current_position = 0
+        if self.current_position + (self.B * self.T * self.num_processes + 1) > self.tokens.size(0):
+            # self.current_position = 0
+            # for multi-gpu running
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
     
 # -------------------------------------------------------
@@ -315,7 +320,10 @@ class DataLoaderLite:
 import os
 import time
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+
 
 # setup the DDP(Distributed Data Parallel) process group
 # torchrun command sets the env varraible RANK, LOCAL_RANK, WORLD_SIZE
@@ -385,7 +393,8 @@ print(f"I am process {ddp_rank} of {ddp_world_size} processes running on {device
 # done running on 2 gpus
 
 # initialize the dataloader
-train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=B, block_size=T)
+# each process will create its own dataloader
+train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=B, block_size=T, process_rank=ddp_rank, process_world_size=ddp_world_size)
 
 
 # set tf32
@@ -393,13 +402,23 @@ torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained('gpt2')
 # print("model weight loading successful, you didn't crash")
+# each process will create its own model
 model = GPT(GPTConfig(vocab_size=50304)) # simply overriding 50257 to 50304 so that pytorch handles the vocab size better
 # model = GPT(GPTConfig())
 print('creating random model')
 model.to(device)
-model = torch.compile(model)
+# disabling compile for now
+# model = torch.compile(model)
+# wrap the model with DDP
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+    # since we are using DDP, it will automatically synchronize the gradients across all processes
+    # Once the loss.backward() is done, it will call allreduce(), the gradients are averaged across all processes
+    # and the averaged gradients will be provided to each process
+    # to update the weights
+    
 
-# lerning rate schedule, linear warmup and cosine decay to a minimum
+# learning rate schedule, linear warmup and cosine decay to a minimum
 max_lr = 6e-4 #following gpt3 paper
 min_lr = max_lr * 0.1 # 10% of max_lr
 warmup_steps = 10
@@ -442,8 +461,25 @@ for step in range(max_steps):
             logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
         loss = loss / accumulation_steps # scale the loss by the number of accumulation steps
         loss_accum += loss.detach() # accumulate the loss
+        if ddp:
+            # if we are using DDP, we need to synchronize the gradients across all processes
+            # this is done automatically by DDP when we call loss.backward()
+            # but we don't want to do this until we have done all the accumulation steps
+            # that's why we call the loss.backward() at the last micro step
+            # we can do this with the ddp.no_sync() context manager
+            # we can also directly set the require_backward_grad_sync flag to False
+            model.require_backward_grad_sync = (micro_steps == accumulation_steps - 1)
+            # kind of hacky, but currently it works
         loss.backward() # set gradients
-
+    
+    if ddp:
+        # loss_accum is not part of the gradient graph,
+        # so each process has it's own loss_accum
+        # we don't want to print the local loss_accum
+        # we want to prin the average loss_accum across all processes
+        # because that is the correct loss for this step
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # sum the loss across all processes
+        
 
     # clip the gradients so model doesn't get a shock with large gradients
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -457,10 +493,14 @@ for step in range(max_steps):
     torch.cuda.synchronize() # wait till GPU is done with all the works
     t1 = time.time()
     dt = (t1 - t0)*1000
-    tokens_processed = (B * T) * accumulation_steps
+    tokens_processed = (B * T) * accumulation_steps * ddp_world_size
     tokens_per_second = tokens_processed / dt
     # tokens_per_second = (train_loader.B * train_loader.T) / dt
-    print(f"Step {step} | loss: {loss_accum.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
+    if master_process:
+        print(f"Step {step} | loss: {loss_accum.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
+
+if ddp:
+    destroy_process_group()
 
 import sys
 sys.exit(0)

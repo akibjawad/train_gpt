@@ -381,7 +381,8 @@ if master_process:
 # test multiple GPUs
 print(f"I am process {ddp_rank} of {ddp_world_size} processes running on {device}")
 
-import sys; sys.exit(0) # for the test running
+# import sys; sys.exit(0) # for the test running, 
+# done running on 2 gpus
 
 # initialize the dataloader
 train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=B, block_size=T)

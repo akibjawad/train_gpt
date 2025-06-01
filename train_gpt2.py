@@ -376,11 +376,13 @@ if torch.cuda.is_available():
 # total_batch_size = 12*1024 # experiment matching previous result with 12 batch size
 # B = 4 # experiment matching previous result with 12 batch size
 
-total_batch_size = 524288 # 2**19, ~0.5M tokens (from the paper gpt3)
-B = 16 # micro batch size
+total_batch_size = 524288 # 2**19, ~0.5M tokens (from the paper gpt3) # number of tokens processed accross all GPUs per step
+B = 16 # micro batch size: This is the batch size per forward/backward pass on each device (GPU).
 T = 1024 # context length/ block size
 # adjusting for the multi-process training
 assert total_batch_size % (B * T * ddp_world_size) == 0, f"total_batch_size {total_batch_size} is not divisible by B*T*ddp_word_size {B*T*ddp_world_size}"
+
+# If your batch doesn't fit in memory, you can accumulate gradients over multiple steps before updating weights. This simulates a larger batch size.
 accumulation_steps = total_batch_size // (B * T * ddp_world_size)
 # all 8 process will print this line, instead make sure only the master process prints it
 if master_process:

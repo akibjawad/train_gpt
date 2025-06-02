@@ -516,95 +516,111 @@ def get_lr(step):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
 
-for step in range(max_steps):
-    t0 = time.time()
-    if step % 10 == 0:
-        model.eval() # set the model to evaluation mode
-        # evaluate the model on the validation set
-        val_loader.reset() # reset the validation loader to the beginning of the first shard
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            val_loss_step = 20 # how many steps to accumulate the validation loss
-            for _ in range(val_loss_step):
-                x, y = val_loader.next_batch()
-                x = x.to(device)
-                y = y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    # parameters are still in float32 but logits are in bfloat16
-                    # only the matrix multiplications are in bfloat16
-                    # softmax, loss, and other operations are in float32
-                    logits, loss = model(x, y)
-                loss = loss/val_loss_step # scale the loss by the number of accumulation steps
-                val_loss_accum += loss.detach() # accumulate the loss
+## Set up profiller for tracking time and memory usage
+from torch.profiler import profile, record_function, ProfilerActivity
+
+profiler = torch.profiler.profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=3), # profile R × (W + U + A) cycles
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_profiler'),
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True,
+    with_modules=True,
+)
+
+with profiler:
+    for step in range(max_steps):
+        if step >= 30:
+            break # for testing purposes, break after 30 steps
+        t0 = time.time()
+        if step % 10 == 0:
+            model.eval() # set the model to evaluation mode
+            # evaluate the model on the validation set
+            val_loader.reset() # reset the validation loader to the beginning of the first shard
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                val_loss_step = 20 # how many steps to accumulate the validation loss
+                for _ in range(val_loss_step):
+                    x, y = val_loader.next_batch()
+                    x = x.to(device)
+                    y = y.to(device)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        # parameters are still in float32 but logits are in bfloat16
+                        # only the matrix multiplications are in bfloat16
+                        # softmax, loss, and other operations are in float32
+                        logits, loss = model(x, y)
+                    loss = loss/val_loss_step # scale the loss by the number of accumulation steps
+                    val_loss_accum += loss.detach() # accumulate the loss
+                if ddp:
+                    # if we are using DDP, we need to synchronize the gradients across all processes
+                    # this is done automatically by DDP when we call loss.backward()
+                    # but we don't want to do this until we have done all the accumulation steps
+                    dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG) # sum the loss across all processes
+                if master_process:
+                    print(f"Validation loss at step {step}: {val_loss_accum.item():.4f}")
+        
+        if step > 0 and step % 10 == 0:
+            # set the model to evaluation
+            model.eval()
+            do_sampling(model,device)
+
+        model.train() # set the model to training mode
+        # training loop
+        optimizer.zero_grad() # zero the gradients, set_to_none=True is more memory efficient
+        loss_accum = 0.0
+        for micro_steps in range(accumulation_steps):
+            # getting a batch of data
+            x, y = train_loader.next_batch()
+            x = x.to(device)
+            y = y.to(device)
+            # print(f"Input shape: {x.shape}, Output shape: {y.shape}")
+            optimizer.zero_grad()
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                # parameters are still in float32 but logits are in bfloat16
+                # only the matrix multiplications are in bfloat16
+                # softmax, loss, and other operations are in float32
+                logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
+            loss = loss / accumulation_steps # scale the loss by the number of accumulation steps
+            loss_accum += loss.detach() # accumulate the loss
             if ddp:
                 # if we are using DDP, we need to synchronize the gradients across all processes
                 # this is done automatically by DDP when we call loss.backward()
                 # but we don't want to do this until we have done all the accumulation steps
-                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG) # sum the loss across all processes
-            if master_process:
-                print(f"Validation loss at step {step}: {val_loss_accum.item():.4f}")
-    
-    if step > 0 and step % 10 == 0:
-        # set the model to evaluation
-        model.eval()
-        do_sampling(model,device)
-
-    model.train() # set the model to training mode
-    # training loop
-    optimizer.zero_grad() # zero the gradients, set_to_none=True is more memory efficient
-    loss_accum = 0.0
-    for micro_steps in range(accumulation_steps):
-        # getting a batch of data
-        x, y = train_loader.next_batch()
-        x = x.to(device)
-        y = y.to(device)
-        # print(f"Input shape: {x.shape}, Output shape: {y.shape}")
-        optimizer.zero_grad()
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            # parameters are still in float32 but logits are in bfloat16
-            # only the matrix multiplications are in bfloat16
-            # softmax, loss, and other operations are in float32
-            logits, loss = model(x, y) # (B, T, vocab_size), (B, T)
-        loss = loss / accumulation_steps # scale the loss by the number of accumulation steps
-        loss_accum += loss.detach() # accumulate the loss
-        if ddp:
-            # if we are using DDP, we need to synchronize the gradients across all processes
-            # this is done automatically by DDP when we call loss.backward()
-            # but we don't want to do this until we have done all the accumulation steps
-            # that's why we call the loss.backward() at the last micro step
-            # we can do this with the ddp.no_sync() context manager
-            # we can also directly set the require_backward_grad_sync flag to False
-            model.require_backward_grad_sync = (micro_steps == accumulation_steps - 1)
-            # kind of hacky, but currently it works
-        loss.backward() # set gradients
-    
-    if ddp:
-        # loss_accum is not part of the gradient graph,
-        # so each process has it's own loss_accum
-        # we don't want to print the local loss_accum
-        # we want to prin the average loss_accum across all processes
-        # because that is the correct loss for this step
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # sum the loss across all processes
+                # that's why we call the loss.backward() at the last micro step
+                # we can do this with the ddp.no_sync() context manager
+                # we can also directly set the require_backward_grad_sync flag to False
+                model.require_backward_grad_sync = (micro_steps == accumulation_steps - 1)
+                # kind of hacky, but currently it works
+            loss.backward() # set gradients
         
+        if ddp:
+            # loss_accum is not part of the gradient graph,
+            # so each process has it's own loss_accum
+            # we don't want to print the local loss_accum
+            # we want to prin the average loss_accum across all processes
+            # because that is the correct loss for this step
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # sum the loss across all processes
+            
 
-    # clip the gradients so model doesn't get a shock with large gradients
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # clip the gradients so model doesn't get a shock with large gradients
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-    # detect and set the learning rate before applying the update
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        # detect and set the learning rate before applying the update
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-    optimizer.step() # update the weights
-    torch.cuda.synchronize() # wait till GPU is done with all the works
-    t1 = time.time()
-    dt = (t1 - t0)*1000
-    tokens_processed = (B * T) * accumulation_steps * ddp_world_size
-    tokens_per_second = (tokens_processed / dt)*1000 # tokens per second, because dt is in milliseconds
-    # tokens_per_second = (train_loader.B * train_loader.T) / dt
-    if master_process:
-        print(f"Step {step} | loss: {loss_accum.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
-
+        optimizer.step() # update the weights
+        torch.cuda.synchronize() # wait till GPU is done with all the works
+        t1 = time.time()
+        dt = (t1 - t0)*1000
+        tokens_processed = (B * T) * accumulation_steps * ddp_world_size
+        tokens_per_second = (tokens_processed / dt)*1000 # tokens per second, because dt is in milliseconds
+        # tokens_per_second = (train_loader.B * train_loader.T) / dt
+        if master_process:
+            print(f"Step {step} | loss: {loss_accum.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
+        profiler.step() # step the profiler to record the time and memory usage
 if ddp:
     destroy_process_group()
 

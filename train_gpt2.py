@@ -267,13 +267,15 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum([p.numel() for p in decay_params])
         num_no_decay_params = sum([p.numel() for p in no_decay_params])
-        print(f'num decay param tensors: {len(decay_params)}, with num decay parameters: {num_decay_params}')
-        print(f'num no decay param tensors: {len(no_decay_params)}, with num no decay parameters: {num_no_decay_params}')
-        
+        if master_process:
+            print(f'num decay param tensors: {len(decay_params)}, with num decay parameters: {num_decay_params}')
+            print(f'num no decay param tensors: {len(no_decay_params)}, with num no decay parameters: {num_no_decay_params}')
+            
         # check if fused adamw is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and 'cuda' in device
-        print(f"Using fused adamw: {use_fused}")
+        if master_process:
+            print(f"Using fused adamw: {use_fused}")
         # use AdamW with weight decay
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         
@@ -310,12 +312,15 @@ class DataLoaderLite:
         assert len(shards) > 0, f"No shards found for split {split} in {data_root}"
         if master_process:
             print(f"Found {len(shards)} shards for split {split}:")
-        
         # state
-        self.current_shard = 0 # current shard index
-        self.tokens = load_tokens(shards[self.current_shard]) # load the first shard
-        # self.current_position = 0
-        self.current_position = self.B * self.T * process_rank
+        self.reset() # reset the dataloader to the beginning of the first shard
+    
+    def reset(self):
+        """Reset the dataloader to the beginning of the current shard."""
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        # self.current_position = 0 # position in 0 for single gpu traning
+        self.current_position = self.B * self.T * self.process_rank
     
     def next_batch(self):
         # you can move those to gpu later when required
@@ -336,7 +341,43 @@ class DataLoaderLite:
         return x, y
     
 # -------------------------------------------------------
-# Test the model
+# Sample from a GPT-2 model
+
+#### Doing sampling on the model
+def do_sampling(model, device):
+    """Do sampling on the model and print the generated text."""
+    num_samples = 4
+    max_length = 32
+    # encode the input text
+    enc = tiktoken.get_encoding("gpt2")
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+    tokens = tokens.unsqueeze(0).repeat(num_samples, 1) # (4,8) 
+    x_gen = tokens.to(device)
+    sample_rng = torch.Generator(device=device)
+    sample_rng.manual_seed(42+ddp_rank)  # set the seed for reproducibility
+    while x_gen.size(1) < max_length:
+        # forward the model to get the logits
+        with torch.no_grad():
+            logits, loss = model(x_gen) # (B, T, vocab_size)
+            #take the logits at the last token
+            logits = logits[:, -1, :] # (B, vocab_size)
+            # get the probabilities
+            probs = F.softmax(logits, dim=-1)
+            # do a top-k sampling of 50 (huggingface pipeline default)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, k)
+            # select a token from the top-k probabilities
+            # multonomial does not demand the probabilities to be normalized, so we can use topk_probs directly
+            ix = torch.multinomial(topk_probs, num_samples=1, generator=sample_rng) #(B, 1)
+            # get the corresponding index
+            xcol = torch.gather(topk_indices, dim=-1, index=ix) # (B, 1)
+            # append the new token to the input
+            x_gen = torch.cat((x_gen, xcol), dim=1)
+    # print the generated tokens
+    for i in range(num_samples):
+        tokens = x_gen[i, :max_length].tolist() # (32,)
+        decoded = enc.decode(tokens)
+        print(f"rank {ddp_rank} sample {i} >{decoded}")
 
 # --------- running multi GPU training loop --------------
 import os
@@ -353,7 +394,7 @@ from torch.distributed import init_process_group, destroy_process_group
 # Hence all code below this line will be multi-threaded/multi-process
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp process?
 if ddp:
-    print("Running in DDP mode")
+    # print("Running in DDP mode")
     assert torch.cuda.is_available(), "CUDA is not available, but DDP requires it"
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
@@ -419,6 +460,7 @@ print(f"I am process {ddp_rank} of {ddp_world_size} processes running on {device
 # initialize the dataloader
 # each process will create its own dataloader
 train_loader = DataLoaderLite(batch_size=B, block_size=T, split='train', process_rank=ddp_rank, process_world_size=ddp_world_size)
+val_loader = DataLoaderLite(batch_size=B, block_size=T, split='val', process_rank=ddp_rank, process_world_size=ddp_world_size)
 
 
 # set tf32
@@ -429,7 +471,7 @@ torch.set_float32_matmul_precision('high')
 # each process will create its own model
 model = GPT(GPTConfig(vocab_size=50304)) # simply overriding 50257 to 50304 so that pytorch handles the vocab size better
 # model = GPT(GPTConfig())
-print('creating random model')
+print(f'creating random model on {device}')
 model.to(device)
 # disabling compile for now
 model = torch.compile(model)
@@ -476,6 +518,40 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_l
 
 for step in range(max_steps):
     t0 = time.time()
+    if step % 10 == 0:
+        model.eval() # set the model to evaluation mode
+        # evaluate the model on the validation set
+        val_loader.reset() # reset the validation loader to the beginning of the first shard
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_step = 20 # how many steps to accumulate the validation loss
+            for _ in range(val_loss_step):
+                x, y = val_loader.next_batch()
+                x = x.to(device)
+                y = y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    # parameters are still in float32 but logits are in bfloat16
+                    # only the matrix multiplications are in bfloat16
+                    # softmax, loss, and other operations are in float32
+                    logits, loss = model(x, y)
+                loss = loss/val_loss_step # scale the loss by the number of accumulation steps
+                val_loss_accum += loss.detach() # accumulate the loss
+            if ddp:
+                # if we are using DDP, we need to synchronize the gradients across all processes
+                # this is done automatically by DDP when we call loss.backward()
+                # but we don't want to do this until we have done all the accumulation steps
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG) # sum the loss across all processes
+            if master_process:
+                print(f"Validation loss at step {step}: {val_loss_accum.item():.4f}")
+    
+    if step > 0 and step % 10 == 0:
+        # set the model to evaluation
+        model.eval()
+        do_sampling(model,device)
+
+    model.train() # set the model to training mode
+    # training loop
+    optimizer.zero_grad() # zero the gradients, set_to_none=True is more memory efficient
     loss_accum = 0.0
     for micro_steps in range(accumulation_steps):
         # getting a batch of data
@@ -524,7 +600,7 @@ for step in range(max_steps):
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_processed = (B * T) * accumulation_steps * ddp_world_size
-    tokens_per_second = tokens_processed / dt
+    tokens_per_second = (tokens_processed / dt)*1000 # tokens per second, because dt is in milliseconds
     # tokens_per_second = (train_loader.B * train_loader.T) / dt
     if master_process:
         print(f"Step {step} | loss: {loss_accum.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
@@ -535,47 +611,3 @@ if ddp:
 import sys
 sys.exit(0)
 
-#### Doing sampling on the model
-
-max_return_sequences = 5
-max_length = 30
-
-model.eval()
-model.to(device)
-
-
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(max_return_sequences,1) # (5,8)
-x = tokens.to(device)
-print(f"Input tokens: {tokens}")
-
-# generate new tokens: currently x is (B=5, T=8)
-# set the seed to 42
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-
-while x.size(1) < max_length:
-    # forward the model to get the logits
-
-    with torch.no_grad():
-        logits = model(x) # (B=5, T=8, vocab_size=50257)
-        # get the logits at the last token
-        logits = logits[:, -1, :] # (B=5, vocab_size=50257)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-
-        # do a top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (B=5, k=50), topk_indices becomes (B=5, k=50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        ix = torch.multinomial(topk_probs, num_samples=1) #(B=5, 1)
-        # get the corresponding index
-        xcol = torch.gather(topk_indices, dim=-1, index=ix)
-        # append the new token to the input
-        x = torch.cat((x, xcol), dim=1)
-# print the generated tokens
-for i in range(max_return_sequences):
-    tokens = x[i, :max_length:].tolist() # (30,)
-    decoded = enc.decode(tokens)
-    print(f">{decoded}")

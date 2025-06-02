@@ -281,23 +281,40 @@ class GPT(nn.Module):
 
 # -------------------------------------------------------
 import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    """Load tokens from a shard file and return them as a tensor."""
+    # npt = np.load(filename)
+    npt = np.memmap(filename, dtype=np.uint16, mode='r')
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
 
 class DataLoaderLite:
-    def __init__(self, datafile, batch_size, block_size, process_rank=0, process_world_size=1):
-        with open(datafile, 'r') as f:
-            data = f.read()
-            f.close()
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(data)
-        self.tokens = torch.tensor(tokens, dtype=torch.long)
+    def __init__(self, batch_size, block_size, split, process_rank=0, process_world_size=1):
         self.B = batch_size
         self.T = block_size
         self.process_rank = process_rank
         self.num_processes = process_world_size
-        # self.num_batches = len(tokens) // (batch_size * block_size)
-        # print(f"1 epoch = : {self.num_batches} batches")
+
+        assert split in ['train', 'val', 'test'], f"Invalid split: {split}, must be one of ['train', 'val', 'test']"
+        
+        # get the shard filenames
+        data_root = 'edu_fineweb10B'
+        shards = os.listdir(data_root)
+        shards = [f for f in shards if split in f]
+        shards = sorted(shards) # sort the shards to ensure consistent order
+        shards = [os.path.join(data_root, f) for f in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"No shards found for split {split} in {data_root}"
+        if master_process:
+            print(f"Found {len(shards)} shards for split {split}:")
+        
         # state
-        self.current_position = 0
+        self.current_shard = 0 # current shard index
+        self.tokens = load_tokens(shards[self.current_shard]) # load the first shard
+        # self.current_position = 0
         self.current_position = self.B * self.T * process_rank
     
     def next_batch(self):
@@ -305,11 +322,16 @@ class DataLoaderLite:
         buff = self.tokens[self.current_position : self.current_position + self.B * self.T +1] # (B*T+1,)
         x = buff[:-1].view(self.B, self.T)
         y = buff[1:].view(self.B, self.T)
+
+        # advance the position in the tensor
         self.current_position += self.B * self.T * self.num_processes
 
+        # if next batch crosses the length of current shard, load the next shard
         if self.current_position + (self.B * self.T * self.num_processes + 1) > self.tokens.size(0):
             # self.current_position = 0
             # for multi-gpu running
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard]) # load the next shard
             self.current_position = self.B * self.T * self.process_rank
         return x, y
     
@@ -377,7 +399,7 @@ if torch.cuda.is_available():
 # B = 4 # experiment matching previous result with 12 batch size
 
 total_batch_size = 524288 # 2**19, ~0.5M tokens (from the paper gpt3) # number of tokens processed accross all GPUs per step
-B = 16 # micro batch size: This is the batch size per forward/backward pass on each device (GPU).
+B = 8 # micro batch size: This is the batch size per forward/backward pass on each device (GPU).
 T = 1024 # context length/ block size
 # adjusting for the multi-process training
 assert total_batch_size % (B * T * ddp_world_size) == 0, f"total_batch_size {total_batch_size} is not divisible by B*T*ddp_word_size {B*T*ddp_world_size}"
@@ -396,7 +418,7 @@ print(f"I am process {ddp_rank} of {ddp_world_size} processes running on {device
 
 # initialize the dataloader
 # each process will create its own dataloader
-train_loader = DataLoaderLite('tiny_shakespeare.txt', batch_size=B, block_size=T, process_rank=ddp_rank, process_world_size=ddp_world_size)
+train_loader = DataLoaderLite(batch_size=B, block_size=T, split='train', process_rank=ddp_rank, process_world_size=ddp_world_size)
 
 
 # set tf32
@@ -425,8 +447,12 @@ raw_model = model.module if ddp else model
 # learning rate schedule, linear warmup and cosine decay to a minimum
 max_lr = 6e-4 #following gpt3 paper
 min_lr = max_lr * 0.1 # 10% of max_lr
-warmup_steps = 10
-max_steps = 50
+
+# warmup_steps = 10
+# max_steps = 50
+
+warmup_steps = 715 # warmup lr until 375M tokens, hence warm up until 375M/2**19
+max_steps = 19073 # per step tokens processed is 524288 (2**19), so 19073 steps will be 524288 tokens processed
 
 def get_lr(step):
     # 1) linear warmup for warmup_steps

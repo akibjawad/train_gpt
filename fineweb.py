@@ -68,7 +68,7 @@ with mp.Pool(processes=nprocs) as pool:
         else:
             # write the current shard to disk and start a new one
             split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.npy")
+            filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
             # split the dataset into whatever can fit into current shard
             remainder = shard_size - token_count
             progress_bar.update(remainder)
@@ -87,7 +87,7 @@ with mp.Pool(processes=nprocs) as pool:
     # if any tokens are left in the buffer, write them to disk
     if token_count > 0:
         split = "val" if shard_index == 0 else "train"
-        filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.npy")
+        filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
         write_datafile(filename, all_tokens[:token_count])
 
 

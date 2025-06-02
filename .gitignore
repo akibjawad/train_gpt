@@ -1,2 +1,24 @@
-*.ipynb
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VSCode or PyCharm
+.vscode/
+.idea/
+
+# bin
 *.bin

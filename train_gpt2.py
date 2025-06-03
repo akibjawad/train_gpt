@@ -522,7 +522,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 profiler = torch.profiler.profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=3), # profile R × (W + U + A) cycles
-    on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_profiler'),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('log_profiler'),
     record_shapes=True,
     profile_memory=True,
     with_stack=True,
@@ -531,8 +531,6 @@ profiler = torch.profiler.profile(
 
 with profiler:
     for step in range(max_steps):
-        if step >= 30:
-            break # for testing purposes, break after 30 steps
         t0 = time.time()
         if step % 10 == 0:
             model.eval() # set the model to evaluation mode

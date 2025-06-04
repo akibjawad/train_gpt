@@ -99,15 +99,89 @@ def do_sampling(model, device):
             # append the new token to the input
             x_gen = torch.cat((x_gen, xcol), dim=1)
     # print the generated tokens
+    print()
+    print('####### Printing generated samples #######')
     for i in range(num_samples):
         tokens = x_gen[i, :max_length].tolist() # (32,)
         decoded = enc.decode(tokens)
         print(f"rank {ddp_rank} sample {i} >{decoded}")
+    print()
 
-# A function to check if torch.compile() has been applied to the model
-def is_torch_compiled(model):
-    return getattr(model, '_compiled', False) or \
-           isinstance(model.forward, torch._dynamo.eval_frame._CompiledFunction)
+#hellaswag evaluation
+def get_most_likely_row(tokens, mask, logits):
+    """
+    Get the most likely row from the logits based on the mask.
+    Args:
+        tokens (torch.Tensor): The input tokens.
+        mask (torch.Tensor): The mask for the tokens.
+        logits (torch.Tensor): The logits from the model.
+    Returns:
+        int: The index of the most likely row.
+    """
+    # evaluate the autoregressive loss at all postions of the endings
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_tokens = tokens[..., 1:].contiguous()
+
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)  # Reshape to (4, N)
+
+    # now average the losses over the ending tokens, mask==1 for each row
+    shift_mask = (mask[..., 1:]).contiguous()  # mask for the ending tokens
+    masked_shift_losses = shift_losses * shift_mask
+    # sum the losses for each row and divide by number of 1s in the mask
+    sum_losses = masked_shift_losses.sum(dim=1)
+    avg_losses = sum_losses / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 endings
+    # get the index of the minimum loss
+    pred = sum_losses.argmin().item()
+    pred_norm = avg_losses.argmin().item()
+    
+    return pred_norm
+
+def hellaswag_eval(model, device):
+    """
+    Evaluate the model on the HellaSwag dataset.
+    Args:
+        model (GPT): The GPT model to evaluate.
+        device (str): The device to run the evaluation on ('cuda', 'cpu', etc.).
+    """
+    from hellaswag import render_example, iterate_examples
+
+    num_correct_norm = 0
+    num_total = 0
+
+    for i, example in enumerate(iterate_examples('val')):
+        # only process examples where i % ddp_world_size == ddp_rank
+        if i % ddp_world_size != ddp_rank:
+            continue
+        _, tokens, mask, label = render_example(example)
+        tokens = tokens.to(device)
+        mask = mask.to(device)
+        # get the logits for the endings
+        with torch.no_grad():
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(tokens)
+            pred_norm = get_most_likely_row(tokens, mask, logits)
+
+            num_total += 1
+            if pred_norm == label:
+                num_correct_norm += 1
+    # reduce the stats across all processes
+    if ddp:
+        num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+        num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+        dist.all_reduce(num_total, op=dist.ReduceOp.SUM)  # sum the total number of examples
+        dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)  # sum the number of correct examples
+        num_total = num_total.item()
+        num_correct_norm = num_correct_norm.item()
+    acc_norm = num_correct_norm / num_total if num_total > 0 else 0
+    if master_process:
+        print(f"HellaSwag Accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+        with open(log_file, 'a') as f:
+            f.write(f"step: {step} hellaswag: {acc_norm:.4f}\n")
 
 # --------- running multi GPU training loop --------------
 import os
@@ -170,7 +244,7 @@ if torch.cuda.is_available():
 # B = 4 # experiment matching previous result with 12 batch size
 
 total_batch_size = 524288 # 2**19, ~0.5M tokens (from the paper gpt3) # number of tokens processed accross all GPUs per step
-B = 8 # micro batch size: This is the batch size per forward/backward pass on each device (GPU).
+B = 64 # micro batch size: This is the batch size per forward/backward pass on each device (GPU).
 T = 1024 # context length/ block size
 # adjusting for the multi-process training
 assert total_batch_size % (B * T * ddp_world_size) == 0, f"total_batch_size {total_batch_size} is not divisible by B*T*ddp_word_size {B*T*ddp_world_size}"
@@ -204,7 +278,11 @@ model = GPT(GPTConfig(vocab_size=50304)) # simply overriding 50257 to 50304 so t
 print(f'creating random model on {device}')
 model.to(device)
 # disabling compile for now
-model = torch.compile(model)
+# make torch compile optional
+use_compile = True # set to True to use torch.compile
+if use_compile:
+    model = torch.compile(model)
+
 # wrap the model with DDP
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -246,26 +324,36 @@ def get_lr(step):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.99,0.995), eps=1e-8)
 
+## a log directory to save training time logs
+log_dir = 'log_train'
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f'log.txt')
+with open(log_file, 'w') as f: # write mode will clear the file
+    pass
+
+
 ## Set up profiller for tracking time and memory usage
 from torch.profiler import profile, record_function, ProfilerActivity
-
+profiler_log_dir = 'log_profiler'
+os.makedirs(profiler_log_dir, exist_ok=True)
 profiler = torch.profiler.profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=3), # profile R × (W + U + A) cycles
-    on_trace_ready=torch.profiler.tensorboard_trace_handler('log_profiler'),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler(profiler_log_dir),
     record_shapes=True,
     profile_memory=True,
     with_stack=True,
     with_modules=True,
 )
+# set to 250 to match result from andrej
+eval_step = 250 # how often to log the training loss
 
 with profiler:
     for step in range(max_steps):
+        last_step = (step == max_steps - 1)
         t0 = time.time()
-        if step >=10:
-            break # for testing purposes, run only 30 steps
 
-        if step % 10 == 0:
+        if step % eval_step == 0 or last_step: 
             model.eval() # set the model to evaluation mode
             # evaluate the model on the validation set
             val_loader.reset() # reset the validation loader to the beginning of the first shard
@@ -290,10 +378,19 @@ with profiler:
                     dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG) # sum the loss across all processes
                 if master_process:
                     print(f"Validation loss at step {step}: {val_loss_accum.item():.4f}")
+                    with open(log_file, 'a') as f:
+                        f.write(f"step {step}: val {val_loss_accum.item():.4f}\n")
         
-        if step > 0 and step % 10 == 0:
+        if (step % eval_step == 0 or last_step): #and (not use_compile):
             # set the model to evaluation
             model.eval()
+            #use hellaswag evaluation
+            hellaswag_eval(model, device)
+
+        if (step % eval_step == 0 or last_step):
+            # set the model to evaluation
+            model.eval()
+            # sample from the model trained so far
             do_sampling(model,device)
 
         model.train() # set the model to training mode
@@ -351,6 +448,8 @@ with profiler:
         # tokens_per_second = (train_loader.B * train_loader.T) / dt
         if master_process:
             print(f"Step {step} | loss: {loss_accum.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
+            with open(log_file, 'a') as f:
+                f.write(f"step {step}: train {loss_accum.item():.6f}")
         profiler.step() # step the profiler to record the time and memory usage
 if ddp:
     # saving the model

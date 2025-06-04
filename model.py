@@ -273,14 +273,14 @@ class GPT(nn.Module):
         num_decay_params = sum([p.numel() for p in decay_params])
         num_no_decay_params = sum([p.numel() for p in no_decay_params])
         # if master_process:
-        print(f'num decay param tensors: {len(decay_params)}, with num decay parameters: {num_decay_params}')
-        print(f'num no decay param tensors: {len(no_decay_params)}, with num no decay parameters: {num_no_decay_params}')
+        # print(f'num decay param tensors: {len(decay_params)}, with num decay parameters: {num_decay_params}')
+        # print(f'num no decay param tensors: {len(no_decay_params)}, with num no decay parameters: {num_no_decay_params}')
             
         # check if fused adamw is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and 'cuda' in device
         # if master_process:
-        print(f"Using fused adamw: {use_fused}")
+        # print(f"Using fused adamw: {use_fused}")
         # use AdamW with weight decay
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         

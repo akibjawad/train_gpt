@@ -99,13 +99,13 @@ def do_sampling(model, device):
             # append the new token to the input
             x_gen = torch.cat((x_gen, xcol), dim=1)
     # print the generated tokens
-    print()
-    print('####### Printing generated samples #######')
+    print('\n')
+    print(f'ddp_rank {ddp_rank}: ####### Printing generated samples ####### \n')
     for i in range(num_samples):
         tokens = x_gen[i, :max_length].tolist() # (32,)
         decoded = enc.decode(tokens)
         print(f"rank {ddp_rank} sample {i} >{decoded}")
-    print()
+    print('\n')
 
 #hellaswag evaluation
 def get_most_likely_row(tokens, mask, logits):
@@ -181,7 +181,7 @@ def hellaswag_eval(model, device):
     if master_process:
         print(f"HellaSwag Accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
         with open(log_file, 'a') as f:
-            f.write(f"step: {step} hellaswag: {acc_norm:.4f}\n")
+            f.write(f"step {step}: hellaswag {acc_norm:.4f}\n")
 
 # --------- running multi GPU training loop --------------
 import os
@@ -383,6 +383,7 @@ with profiler:
         
         if (step % eval_step == 0 or last_step): #and (not use_compile):
             # set the model to evaluation
+            print(f"ddp_rank {ddp_rank}: Evaluating model on HellaSwag dataset")
             model.eval()
             #use hellaswag evaluation
             hellaswag_eval(model, device)
@@ -449,7 +450,7 @@ with profiler:
         if master_process:
             print(f"Step {step} | loss: {loss_accum.item():.6f} | lr:{lr:0.4e} | norm {norm:0.4f} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
             with open(log_file, 'a') as f:
-                f.write(f"step {step}: train {loss_accum.item():.6f}")
+                f.write(f"step {step}: train {loss_accum.item():.6f}\n")
         profiler.step() # step the profiler to record the time and memory usage
 if ddp:
     # saving the model

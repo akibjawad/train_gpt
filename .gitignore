@@ -20,8 +20,12 @@ env/
 .vscode/
 .idea/
 log_profiler/
+log_train/
+hellaswag/
+models/
 
 # bin
 *.bin
 *.pt
 *.pkl
+*.log

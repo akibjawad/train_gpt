@@ -1,0 +1,293 @@
+# keeping other classes in the model.py same as before
+
+from dataclasses import dataclass
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import math
+import inspect
+import json
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.act = nn.GELU(approximate='tanh')
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0
+        # self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.act(x)
+        # x = self.dropout(x)
+        x = self.c_proj(x)
+        return x
+    
+class CausalSelfAttention(nn.Module):
+    """ Multi-head masked (combined in to a single head of size n_embed for simpler computation) self-attention module """
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0, "Embedding dimension must be divisible by number of heads"
+        # key, query, value projections for all heads but in a batched way
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0
+        # for regularization
+        self.n_head = config.n_head
+        self.n_embed = config.n_embd
+        # not really a bias, it's just a mask, following naming pattern of OpenAI/HuggingFace
+        # inital 1, 1 are for batch and nh dimensions, helps to understand the broadcasting
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.shape # B is batch size, T is sequence length, C is number of channels
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # nh in "number of heads", hs is "head size", and C is "number of channels" = nh * hs
+        # for example, in GPT2 (124M params), nh=12, hs=64, C=768
+
+        # get qkv combined
+        qkv = self.c_attn(x) # x(B,T,C) -> qkv(B,T,3*C)
+        # qkv = [ [ QQQQQQ | KKKKKK | VVVVVV ],
+        #           [ QQQQQQ | KKKKKK | VVVVVV ],
+        #           ...
+        #           [ QQQQQQ | KKKKKK | VVVVVV ], 
+        #       ]
+
+        # split into q, k, v
+        q,k,v = qkv.split(self.n_embed, dim=2) # split into 3 tensors of size (B,T,C)
+        # q = [ [QQQQQQ], [QQQQQQ], ... ]
+        # k = [ [KKKKKK], [KKKKKK], ... ]
+        # v = [ [VVVVVV], [VVVVVV], ... ]   
+
+        # C dimension is broken into n_heads self-attention heads where each head has size hs = C / n_heads
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,T,C) -> (B,T,nh,hs) -> after transpose (B,nh,T,hs) 
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,T,C) -> (B,T,nh,hs) -> (B,nh,T,hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,T,C) -> (B,T,nh,hs) -> (B,nh,T,hs)
+        # this way n_head is like a batch dimension, making sure n_heads are computed in parallel
+
+        # attention mask is the (B, nh, T, T) tensor
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / (math.sqrt(k.size(-1)))) # (B,nh,T,hs) @ (B,nh,hs,T) -> (B,nh,T,T)
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B,nh,T,T) -> (B,nh,T,T)
+        # att = F.softmax(att, dim=-1)
+        # y = (att @ v) # (B,nh,T,T) @ (B,nh,T,hs) -> (B,nh,T,hs)
+
+        # use flassh attention instead of the regular attention calculation
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
+
+        # reassmble the heads back into the embedding dimension
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # (B,nh,T,hs) -> (B,T,nh*hs) -> (B,T,C)
+
+        y = self.c_proj(y) # (B,T,C) -> (B,T,C)
+        return y
+    
+
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        # from the gpt2 paper: 
+        # "We scale the weights of the residual layers at initialization by 1/sqrt(N) where N is the number of residual layers in the block"
+        # to implement this follw the flag NANOGPT_SCALE in c_proj (last layer of each block)
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+
+    def to_json_string(self):
+        """Serializes this instance to a JSON string."""
+        return json.dumps(self.__dict__, indent=4, sort_keys=True) + "\n"
+
+
+
+# creating a pipeline module for GPT model using DeepSpeed
+
+from deepspeed.pipeline import PipelineModule, LayerSpec
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import inspect
+
+class GPTPipelineModule(PipelineModule):
+
+    def __init__(self, config: GPTConfig, num_stages=2, **kwargs):
+        """
+        Initialize the GPTPipelineModule with the given configuration and number of stages.
+        
+        Args:
+            config (GPTConfig): Configuration object for the GPT model.
+            num_stages (int, optional): Number of stages for pipeline parallelism.
+            **kwargs: Additional keyword arguments for PipelineModule.
+        """
+        self.config = config
+
+        # defining the embedding layers
+        def embedding_module():
+            """
+            Create the embedding layers for the pipeline module.
+            Returns:
+                nn.Module: A module containing the embedding layers.
+            """
+
+            class EmbeddingModule(nn.Module):
+                def __init__(self, config):
+                    super().__init__()
+                    self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+                    self.wpe = nn.Embedding(config.block_size, config.n_embd)
+
+                def forward(self, x):
+                    B, T = x.shape # B is batch size, T is sequence length
+                    pos = torch.arange(0, T, device=x.device, dtype=torch.long) # create position tensor
+                    tok_emb = self.wte(x) # token embeddings #(B, T, n_embd)
+                    pos_emb = self.wpe(pos) # position embeddings #(T, n_embd)
+                    x = tok_emb + pos_emb # add position embeddings to token embeddings, # (B, T, n_embd) + (T, n_embd) -> (B, T, n_embd)
+                    return x
+            return EmbeddingModule(self.config)
+        
+        # defining the transformer layers
+        # each block of the transformer will be a separate layer in the pipeline module
+        # hence simply calling Block(config) will create a layer for each block
+        
+        # defining the final layer norm and lm_head
+        def lm_head_module():
+            """
+            Create the final layer norm and lm_head for the pipeline module.
+            Returns:
+                nn.Module: A module containing the final layer norm and lm_head.
+            """
+            class LmHeadModule(nn.Module):
+                def __init__(self, config):
+                    super().__init__()
+                    self.ln_f = nn.LayerNorm(config.n_embd)
+                    self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+                def forward(self, x):
+                    x = self.ln_f(x)
+                    loss = None
+                    x = self.lm_head(x)
+                    return x
+            return LmHeadModule(self.config)
+        
+
+        
+
+        layers = []
+        # adding embedding layers in the first stage
+        layers.append(LayerSpec(embedding_module()))
+        # divide transformer layers into stages
+        # list all the hidden layers
+        # layers will be divided into num_stages by pipeline module
+        for i in range(config.n_layer):
+            layers.append(LayerSpec(self.Block(config)))
+        # the Block class is defined above, it contains the causal self-attention and MLP layers
+
+        # adding layer norm and lm_head in the last stage
+        layers.append(LayerSpec(lm_head_module()))
+        
+        # define cross entropy loss function
+        # this is used in the forward method of the pipeline module
+        
+        def cross_entropy_loss_fn(logits, labels):
+            """
+            Custom cross entropy loss function for the pipeline module.
+            Args:
+                logits (torch.Tensor): The output logits from the model.
+                labels (torch.Tensor): The ground truth labels.
+            Returns:
+                torch.Tensor: The computed cross entropy loss.
+            """
+            # reshape logits and labels to match the expected shape
+            # (B, T, vocab_size) -> (B*T, vocab_size)
+            logits = logits.view(-1, self.config.vocab_size)
+            # (B, T) -> (B*T)
+            labels = labels.view(-1)
+            # calculate the loss
+            loss = F.cross_entropy(logits, labels)
+            return loss
+
+        # now define the pipeline module with the layers
+        super().__init__(
+            layers=layers,
+            num_stages=num_stages,
+            loss_fn=cross_entropy_loss_fn,
+            partition_method='layers',
+            **kwargs
+        )
+
+        # skipping the weight sharing for simplicity, but it can be added later
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # if the module has the NANOGPT_SCALE_INIT attribute, use it to scale the weights
+                # 2 comes from 2 types of layers (mlp and attn)
+                # this is where we follow the quote from the gpt2 paper
+                # "We scale the weights of the residual layers at initialization by 1/sqrt(N) where N is the number of residual layers in the block"
+                # to implement this follow the flag NANOGPT_SCALE in c_proj (last layer of each block)
+
+                std *= (2*self.config.n_layer) ** -0.5 # 2 comes from 2 types of layers (mlp and attn)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        # layerNorm is not initialized explicitly, it is initialized by default from pytorch to be mean=0, std=1
+        # elif isinstance(module, nn.LayerNorm):
+        #     module.bias.data.zero_()
+        #     module.weight.data.fill_(1.0)
+        # elif isinstance(module, CausalSelfAttention):
+        #     # initialize the attention weights
+        #     module.c_attn.weight.data.normal_(mean=0.0, std=0.02)
+        #     module.c_proj.weight.data.normal_(mean=0.0, std=0.02)
+    
+    @staticmethod
+    def configure_optimizers(self, weight_decay=0.1, learning_rate=6e-4, device='cpu'):
+        # configure the optimizer 
+        # find parameters that should decay weights (requires_grad and dim>=2) and those should not decay weights (not requires_grad)
+        param_dict = {pn:p for pn, p in self.named_parameters()}
+        param_dict = {pn:p for pn, p in param_dict.items() if p.requires_grad}
+        # create a optim_groups. Any parameter that is 2D or more will be in the decay group, else in the no decay group
+        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+        no_decay_params = [p for _, p in param_dict.items() if p.dim() < 2] # bias and layernorm, etc
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum([p.numel() for p in decay_params])
+        num_no_decay_params = sum([p.numel() for p in no_decay_params])
+        # if master_process:
+        # print(f'num decay param tensors: {len(decay_params)}, with num decay parameters: {num_decay_params}')
+        # print(f'num no decay param tensors: {len(no_decay_params)}, with num no decay parameters: {num_no_decay_params}')
+            
+        # check if fused adamw is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        # if master_process:
+        # print(f"Using fused adamw: {use_fused}")
+        # use AdamW with weight decay
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        
+        return optimizer
+
+    # generation will not be implemented in the pipeline module, it will be done after the training
+    

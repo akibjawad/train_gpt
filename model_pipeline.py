@@ -119,7 +119,7 @@ class GPTConfig:
 
 # creating a pipeline module for GPT model using DeepSpeed
 
-from deepspeed.pipeline import PipelineModule, LayerSpec
+from deepspeed.pipe import PipelineModule, LayerSpec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -180,9 +180,12 @@ class GPTPipelineModule(PipelineModule):
 
                 def forward(self, x):
                     x = self.ln_f(x)
-                    loss = None
-                    x = self.lm_head(x)
-                    return x
+                    # deepspeed will process y and calculate the loss
+                    # with the provided function as loss_fn
+                    # hence no need to return loss here
+                    loss = None 
+                    logits = self.lm_head(x)
+                    return logits
             return LmHeadModule(self.config)
         
 
@@ -260,7 +263,6 @@ class GPTPipelineModule(PipelineModule):
         #     module.c_attn.weight.data.normal_(mean=0.0, std=0.02)
         #     module.c_proj.weight.data.normal_(mean=0.0, std=0.02)
     
-    @staticmethod
     def configure_optimizers(self, weight_decay=0.1, learning_rate=6e-4, device='cpu'):
         # configure the optimizer 
         # find parameters that should decay weights (requires_grad and dim>=2) and those should not decay weights (not requires_grad)
@@ -290,4 +292,3 @@ class GPTPipelineModule(PipelineModule):
         return optimizer
 
     # generation will not be implemented in the pipeline module, it will be done after the training
-    

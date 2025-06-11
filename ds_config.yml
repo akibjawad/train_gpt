@@ -1,0 +1,47 @@
+# DeepSpeed configuration file for training a model with DeepSpeed
+# number of tokens processed accross all GPUs per step
+# from the paper gpt3 per step 524288 tokens are processed
+# processing 524288 tokens per step 
+# one batch has 1024 tokens
+block_size: 1024
+# hence 524288 / 1024 = 512 batches per step
+train_batch_size: 512
+
+# micro batch size: This is the batch size per forward/backward pass on each device (GPU)
+train_micro_batch_size_per_gpu: 8
+
+# Running on 2 (data parallel size) gpus
+# number of steps to accumulate gradients before performing an optimizer step
+# gradient accumulation steps of 4
+gradient_accumulation_steps: 32
+
+# total_batch_size = micro_batch_size * gradient_accumulation_steps * number_of_gpus
+
+
+# optimizer is configured manually in the training script
+
+# schduler config 
+scheduler:
+    type: WarmupDecayLR
+    # params for the scheduler
+    params:
+        warmup_min_lr: 6e-5 # 10% of max_lr
+        warmup_max_lr: 6e-4 #following gpt3 paper
+        warmup_num_steps: 715 # warmup lr until 375M tokens, hence warm up until 375M/2**19
+        total_num_steps: 19073 # per step tokens processed is 524288 (2**19), so 19073 steps will be 524288 tokens processed
+
+steps_per_print: 100
+
+zero_optimization:
+    stage: 1
+    offload_optimizer: 
+        device: none
+    offload_param:
+        device: none
+
+gradient_clipping: 1.0
+
+pipeline:
+  enabled: true
+
+wall_clock_breakdown: true

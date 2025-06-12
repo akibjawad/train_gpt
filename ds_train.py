@@ -2,8 +2,10 @@ import torch
 import torch.nn.functional as F
 import deepspeed
 import deepspeed.comm as dist
+
 # initializing distributed
 deepspeed.init_distributed()
+
 # data loader portion for training with deepspeed
 from data_loader_fw import DataLoaderLite
 import os
@@ -254,4 +256,6 @@ for step in range(max_steps):
     if local_rank == 0:
         curr_loss = loss.item()
         curr_lr = model_engine.get_lr()[0]
+        # you cannot get the global gradient norm directly from the model engine
+        # grad_norm = model_engine.get_gradient_norm()
         print(f"Step {step} | loss: {loss.item():.6f} | lr:{curr_lr:0.4e} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")

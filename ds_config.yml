@@ -8,12 +8,12 @@ block_size: 1024
 train_batch_size: 512
 
 # micro batch size: This is the batch size per forward/backward pass on each device (GPU)
-train_micro_batch_size_per_gpu: 2
+train_micro_batch_size_per_gpu: 8
 
 # Running on 2 (data parallel size) gpus
 # number of steps to accumulate gradients before performing an optimizer step
 # gradient accumulation steps of 4
-gradient_accumulation_steps: 256
+gradient_accumulation_steps: 64
 
 # total_batch_size = micro_batch_size * gradient_accumulation_steps * number_of_gpus
 
@@ -22,6 +22,10 @@ gradient_accumulation_steps: 256
 # schduler is also configured manually in the training script
 
 steps_per_print: 100
+
+# loss scaling is used to prevent overflow of gradients
+bf16:
+    enabled: true
 
 zero_optimization:
     stage: 1
@@ -37,4 +41,5 @@ gradient_clipping: 1.0
 pipeline:
   enabled: true
 
-wall_clock_breakdown: true
+# for time breakdown profiling
+# wall_clock_breakdown: true

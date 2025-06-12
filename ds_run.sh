@@ -1,4 +1,4 @@
 deepspeed --num_gpus 1 \
-    train_with_ds.py \
+    ds_train.py \
     --deepspeed \
-    --deepspeed_config ds_config.yaml
+    --deepspeed_config ds_config.yml

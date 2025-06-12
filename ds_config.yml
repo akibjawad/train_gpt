@@ -8,27 +8,18 @@ block_size: 1024
 train_batch_size: 512
 
 # micro batch size: This is the batch size per forward/backward pass on each device (GPU)
-train_micro_batch_size_per_gpu: 8
+train_micro_batch_size_per_gpu: 2
 
 # Running on 2 (data parallel size) gpus
 # number of steps to accumulate gradients before performing an optimizer step
 # gradient accumulation steps of 4
-gradient_accumulation_steps: 32
+gradient_accumulation_steps: 256
 
 # total_batch_size = micro_batch_size * gradient_accumulation_steps * number_of_gpus
 
-
 # optimizer is configured manually in the training script
 
-# schduler config 
-scheduler:
-    type: WarmupDecayLR
-    # params for the scheduler
-    params:
-        warmup_min_lr: 6e-5 # 10% of max_lr
-        warmup_max_lr: 6e-4 #following gpt3 paper
-        warmup_num_steps: 715 # warmup lr until 375M tokens, hence warm up until 375M/2**19
-        total_num_steps: 19073 # per step tokens processed is 524288 (2**19), so 19073 steps will be 524288 tokens processed
+# schduler is also configured manually in the training script
 
 steps_per_print: 100
 
@@ -36,8 +27,10 @@ zero_optimization:
     stage: 1
     offload_optimizer: 
         device: none
+        # pin_memory: true
     offload_param:
         device: none
+        # pin_memory: true
 
 gradient_clipping: 1.0
 

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import math
 import inspect
 import json
 
@@ -89,10 +88,12 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
+        self.apply(self._init_weights)  # initialize the weights of the block
 
     def forward(self, x):
         # from the gpt2 paper: 
@@ -101,7 +102,72 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+    
+    def _init_weights(self, module):
+        # initialize the weights of the module
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # if the module has the NANOGPT_SCALE_INIT attribute, use it to scale the weights
+                # 2 comes from 2 types of layers (mlp and attn)
+                # this is where we follow the quote from the gpt2 paper
+                # "We scale the weights of the residual layers at initialization by 1/sqrt(N) where N is the number of residual layers in the block"
+                # to implement this follow the flag NANOGPT_SCALE in c_proj (last layer of each block)
 
+                std *= (2*self.config.n_layer) ** -0.5 # 2 comes from 2 types of layers (mlp and attn)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+# defining the final layer norm and lm_head
+class LmHeadModule(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.apply(self._init_weights)  # initialize the weights of the lm_head
+
+    def forward(self, x):
+        x = self.ln_f(x)
+        # deepspeed will process y and calculate the loss
+        # with the provided function as loss_fn
+        # hence no need to return loss here
+        loss = None 
+        logits = self.lm_head(x)
+        return logits
+    
+    def _init_weights(self, module):
+        # initialize the weights of the lm_head
+        # layer norm is initialized by default from pytorch to be mean=0, std=1
+        # elif isinstance(module, nn.LayerNorm):
+        #     module.bias.data.zero_()
+        #     module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear):
+            # initialize the linear layer weights (lm_head)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+# defining the embedding layers
+class EmbeddingModule(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.wpe = nn.Embedding(config.block_size, config.n_embd)
+        self.apply(self._init_weights)  # initialize the weights of the embedding layers
+
+    def forward(self, x):
+        B, T = x.shape # B is batch size, T is sequence length
+        pos = torch.arange(0, T, device=x.device, dtype=torch.long) # create position tensor
+        tok_emb = self.wte(x) # token embeddings #(B, T, n_embd)
+        pos_emb = self.wpe(pos) # position embeddings #(T, n_embd)
+        x = tok_emb + pos_emb # add position embeddings to token embeddings, # (B, T, n_embd) + (T, n_embd) -> (B, T, n_embd)
+        return x
+    
+    def _init_weights(self, module):
+        # initialize the weights of the embedding layers
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 @dataclass
 class GPTConfig:
@@ -117,17 +183,11 @@ class GPTConfig:
 
 
 
-# creating a pipeline module for GPT model using DeepSpeed
+##### Process loss function and the configure optimizer later in the pipeline module
 
-from deepspeed.pipe import PipelineModule, LayerSpec
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import inspect
+class GPTLayeredModule(nn.Module):
 
-class GPTPipelineModule(PipelineModule):
-
-    def __init__(self, config: GPTConfig, num_stages=2, **kwargs):
+    def __init__(self, config: GPTConfig):
         """
         Initialize the GPTPipelineModule with the given configuration and number of stages.
         
@@ -138,130 +198,50 @@ class GPTPipelineModule(PipelineModule):
         """
         self.config = config
 
-        # defining the embedding layers
-        def embedding_module():
-            """
-            Create the embedding layers for the pipeline module.
-            Returns:
-                nn.Module: A module containing the embedding layers.
-            """
 
-            class EmbeddingModule(nn.Module):
-                def __init__(self, config):
-                    super().__init__()
-                    self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-                    self.wpe = nn.Embedding(config.block_size, config.n_embd)
-
-                def forward(self, x):
-                    B, T = x.shape # B is batch size, T is sequence length
-                    pos = torch.arange(0, T, device=x.device, dtype=torch.long) # create position tensor
-                    tok_emb = self.wte(x) # token embeddings #(B, T, n_embd)
-                    pos_emb = self.wpe(pos) # position embeddings #(T, n_embd)
-                    x = tok_emb + pos_emb # add position embeddings to token embeddings, # (B, T, n_embd) + (T, n_embd) -> (B, T, n_embd)
-                    return x
-            return EmbeddingModule(self.config)
+            
+        
         
         # defining the transformer layers
         # each block of the transformer will be a separate layer in the pipeline module
         # hence simply calling Block(config) will create a layer for each block
         
-        # defining the final layer norm and lm_head
-        def lm_head_module():
+        
+
+        def get_layers(self):
             """
-            Create the final layer norm and lm_head for the pipeline module.
+            Get the layers of the model module.
             Returns:
-                nn.Module: A module containing the final layer norm and lm_head.
+                list: A list of LayerSpec objects representing the layers.
             """
-            class LmHeadModule(nn.Module):
-                def __init__(self, config):
-                    super().__init__()
-                    self.ln_f = nn.LayerNorm(config.n_embd)
-                    self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            from deepspeed.pipe import LayerSpec
+            layers = []
+            # adding embedding layers in the first stage
+            layers.append(LayerSpec(embedding_module()))
+            # divide transformer layers into stages
+            # list all the hidden layers
+            # layers will be divided into num_stages by pipeline module
+            for i in range(self.config.n_layer):
+                layers.append(LayerSpec(self.Block(self.config)))
+            # the Block class is defined above, it contains the causal self-attention and MLP layers
 
-                def forward(self, x):
-                    x = self.ln_f(x)
-                    # deepspeed will process y and calculate the loss
-                    # with the provided function as loss_fn
-                    # hence no need to return loss here
-                    loss = None 
-                    logits = self.lm_head(x)
-                    return logits
-            return LmHeadModule(self.config)
-        
+            # adding layer norm and lm_head in the last stage
+            layers.append(LayerSpec(lm_head_module()))
 
-        
+            return layers
 
-        layers = []
-        # adding embedding layers in the first stage
-        layers.append(LayerSpec(embedding_module()))
-        # divide transformer layers into stages
-        # list all the hidden layers
-        # layers will be divided into num_stages by pipeline module
-        for i in range(config.n_layer):
-            layers.append(LayerSpec(self.Block(config)))
-        # the Block class is defined above, it contains the causal self-attention and MLP layers
 
-        # adding layer norm and lm_head in the last stage
-        layers.append(LayerSpec(lm_head_module()))
-        
-        # define cross entropy loss function
-        # this is used in the forward method of the pipeline module
-        
-        def cross_entropy_loss_fn(logits, labels):
-            """
-            Custom cross entropy loss function for the pipeline module.
-            Args:
-                logits (torch.Tensor): The output logits from the model.
-                labels (torch.Tensor): The ground truth labels.
-            Returns:
-                torch.Tensor: The computed cross entropy loss.
-            """
-            # reshape logits and labels to match the expected shape
-            # (B, T, vocab_size) -> (B*T, vocab_size)
-            logits = logits.view(-1, self.config.vocab_size)
-            # (B, T) -> (B*T)
-            labels = labels.view(-1)
-            # calculate the loss
-            loss = F.cross_entropy(logits, labels)
-            return loss
-
-        # now define the pipeline module with the layers
-        super().__init__(
-            layers=layers,
-            num_stages=num_stages,
-            loss_fn=cross_entropy_loss_fn,
-            partition_method='layers',
-            **kwargs
-        )
+        # # now define the pipeline module with the layers
+        # super().__init__(
+        #     layers=layers,
+        #     num_stages=num_stages,
+        #     loss_fn=cross_entropy_loss_fn,
+        #     partition_method='layers',
+        #     **kwargs
+        # )
 
         # skipping the weight sharing for simplicity, but it can be added later
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.Linear):
-            std = 0.02
-            if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                # if the module has the NANOGPT_SCALE_INIT attribute, use it to scale the weights
-                # 2 comes from 2 types of layers (mlp and attn)
-                # this is where we follow the quote from the gpt2 paper
-                # "We scale the weights of the residual layers at initialization by 1/sqrt(N) where N is the number of residual layers in the block"
-                # to implement this follow the flag NANOGPT_SCALE in c_proj (last layer of each block)
-
-                std *= (2*self.config.n_layer) ** -0.5 # 2 comes from 2 types of layers (mlp and attn)
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        # layerNorm is not initialized explicitly, it is initialized by default from pytorch to be mean=0, std=1
-        # elif isinstance(module, nn.LayerNorm):
-        #     module.bias.data.zero_()
-        #     module.weight.data.fill_(1.0)
-        # elif isinstance(module, CausalSelfAttention):
-        #     # initialize the attention weights
-        #     module.c_attn.weight.data.normal_(mean=0.0, std=0.02)
-        #     module.c_proj.weight.data.normal_(mean=0.0, std=0.02)
+        
     
     def configure_optimizers(self, weight_decay=0.1, learning_rate=6e-4, device='cpu'):
         # configure the optimizer 

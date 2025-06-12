@@ -166,7 +166,8 @@ class SimpleGetLRScheduler(_LRScheduler):
         super().__init__(optimizer, last_epoch)
     
     def get_lr(self):
-        step = self.last_epoch + 1  # step is 0-indexed, so we add 1 to get the current step
+        # epoch is 1 indexed but step is calculated based on 0 indexed
+        step = self.last_epoch - 1
         print(f"[LRScheduler] Step = {step}")
         # 1) linear warmup for warmup_steps
         if step < self.warmup_steps:

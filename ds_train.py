@@ -1,14 +1,16 @@
-import torch
-import torch.nn.functional as F
-import deepspeed
-import deepspeed.comm as dist
-
-# initializing distributed
-deepspeed.init_distributed()
-
-# data loader portion for training with deepspeed
-from data_loader_fw import DataLoaderLite
+# defining argument parser
 import os
+import argparse
+def parse_args():
+    parser = argparse.ArgumentParser(description="GPT Training with DeepSpeed")
+    parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
+    parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
+    parser.add_argument('--deepspeed', action='store_true', help='Use DeepSpeed')
+    parser.add_argument('--deepspeed_config', type=str, default='ds_config.yml', help='Path to DeepSpeed config file')
+    parser.add_argument('--block_size', type=int, default=1024, help='Context length / block size')
+    parser.add_argument('--pipeline_parallel_size', type=int, default=1, help='Pipeline parallel size')
+    args = parser.parse_args()
+    return args
 
 # validation loss calculation
 def calculate_val_loss(model_engine, curr_step, val_loader, val_loss_step, device):
@@ -40,24 +42,22 @@ def calculate_val_loss(model_engine, curr_step, val_loader, val_loss_step, devic
             #     f.write(f"step {step}: val {val_loss_accum.item():.4f}\n")
         model_engine.train() # set the model back to training mode
 
+# script will run on all gpus
+args = parse_args()
+print(args)
 
-#load the deepspeed config file
-import json
-import yaml
-with open('ds_config.yml') as f:
-    ds_config = yaml.safe_load(f)
+if args.deepspeed:
+    print("Using DeepSpeed")
+else:
+    print("Not using DeepSpeed")
+    exit(1)
 
-B = ds_config['train_micro_batch_size_per_gpu'] # full batch size
-T = ds_config['block_size'] # context length/ block size
-grad_accum_steps = ds_config['gradient_accumulation_steps']
 
-# deepspeed config file requires json format
-# convert the yaml config to json
-with open('ds_config.json', 'w') as f:
-    json.dump(ds_config, f, indent=4)
+import torch
+assert torch.cuda.is_available(), "CUDA is not available, but Deepspeed requires it"
 
-local_rank = int(os.environ.get('LOCAL_RANK', 0))
-device = f'cuda:{local_rank}'
+global_rank = int(os.environ['RANK'])
+device = f'cuda:{global_rank}'
 torch.cuda.set_device(device)
 
 # seed
@@ -65,40 +65,27 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-#data loader
-# ddp_rank = dist.get_data_parallel_rank()
-# ddp_world_size = dist.get_data_parallel_world_size()
+# also available at args.num_gpus
+global_world_size = int(os.environ['WORLD_SIZE'])
+# global_world_size = args.num_gpus
 
-# running without ddp for now, pure piepeline parallelism
-ddp_rank = 0
-ddp_world_size = 1
+num_pp = args.pipeline_parallel_size
+num_dp = global_world_size // num_pp
 
+print(f'setting up pipeline parallelism with {num_pp} pipeline parallel groups and {num_dp} data parallel groups')
 
+import deepspeed
+# initializing distributed
+deepspeed.init_distributed()
 
-train_loader = DataLoaderLite(batch_size=B, block_size=T, split='train', process_rank=ddp_rank, process_world_size=ddp_world_size)
-val_loader = DataLoaderLite(batch_size=B, block_size=T, split='val', process_rank=ddp_rank, process_world_size=ddp_world_size)
+from deepspeed.runtime.pipe.topology import PipeDataParallelTopology
+topology = PipeDataParallelTopology(num_pp, num_dp)
 
-def tain_iter():
-    for _ in range(grad_accum_steps):
-        # get the next batch of data
-        x, y = train_loader.next_batch()
-        x = x.to(device)
-        y = y.to(device)
-        # yield the batch for the pipeline module to process
-        yield x, y
-
-def val_iter():
-    yield train_loader.next_batch()
-
-
-# set tf32 matmul precision
-torch.set_float32_matmul_precision('high')
-
-# model configuration
+# load the model configuration and model
 from ds_model import GPTConfig, EmbeddingModule, LmHeadModule, Block
-from deepspeed.pipe import PipelineModule, LayerSpec
 model_config = (GPTConfig(vocab_size=50304))
 
+from deepspeed.pipe import PipelineModule, LayerSpec
 # gather layers for the pipeline
 layers = []
 layers.append(LayerSpec(EmbeddingModule, model_config))
@@ -107,10 +94,9 @@ for _ in range(model_config.n_layer):
     layers.append(LayerSpec(Block, model_config))
 layers.append(LayerSpec(LmHeadModule, model_config))
 
-
-
 # define cross entropy loss function
 # this is used in the forward method of the pipeline module
+import torch.nn.functional as F
 def cross_entropy_loss_fn(logits, labels):
     """
     Custom cross entropy loss function for the pipeline module.
@@ -128,6 +114,15 @@ def cross_entropy_loss_fn(logits, labels):
     # calculate the loss
     loss = F.cross_entropy(logits, labels)
     return loss
+
+# create the pipeline model
+model = PipelineModule(layers=layers,
+                       loss_fn=cross_entropy_loss_fn,
+                       partition_method='parameters',
+                       topology=topology,
+                       )
+# deepspped internally moves the model to the correct device
+# so we don't need to call model.to(device) here
 
 def configure_pipeline_optimizers(pipeline_model, weight_decay=0.1, learning_rate=6e-4, device='cuda'):
     import inspect
@@ -170,7 +165,7 @@ class SimpleGetLRScheduler(_LRScheduler):
     def get_lr(self):
         # epoch is 1 indexed but step is calculated based on 0 indexed
         step = self.last_epoch - 1
-        print(f"[LRScheduler] Step = {step}")
+        # print(f"[LRScheduler] Step = {step}")
         # 1) linear warmup for warmup_steps
         if step < self.warmup_steps:
             return [self.max_lr * (step+1) / self.warmup_steps] # step is 0-indexed
@@ -183,16 +178,6 @@ class SimpleGetLRScheduler(_LRScheduler):
         assert 0 <= decay_ratio <= 1
         coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio)) # coeff starting from 1 to 0
         return [self.min_lr + coeff * (self.max_lr - self.min_lr)]
-
-
-# create the pipeline model
-model = PipelineModule(layers=layers,
-                       loss_fn=cross_entropy_loss_fn,
-                       num_stages=1,
-                       partition_method='parameters',
-                       )
-# deepspped internally moves the model to the correct device
-# so we don't need to call model.to(device) here
 
 # configure the optimizer
 optimizer = configure_pipeline_optimizers(model, weight_decay=0.1,learning_rate=6e-4,device=device)
@@ -212,6 +197,16 @@ lr_scheduler = SimpleGetLRScheduler(
 #### for manual configuration we could've used the following code
 # custom_lr_scheduler = torch.optim.lr_scheduler.LambdaLR(custom_optimizer, get_lr)
 
+# read the deepspeed config file
+import yaml
+with open(args.deepspeed_config) as f:
+    ds_config = yaml.safe_load(f)
+
+# deepspeed config file requires json format
+# convert the yaml config to json
+# with open('ds_config.json', 'w') as f:
+#     json.dump(ds_config, f, indent=4)
+
 # deepspeed training engine
 model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
     model=model,
@@ -221,6 +216,38 @@ model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
     config_params=ds_config
     # mpu=None,  # not using model parallelism
 )
+
+T = args.block_size
+B = ds_config['train_micro_batch_size_per_gpu'] # micro batch size per GPU
+grad_accum_steps = ds_config['gradient_accumulation_steps']
+
+mpu = model_engine.mpu
+ddp_rank = mpu.get_data_parallel_rank()
+ddp_world_size = mpu.get_data_parallel_world_size()
+
+#load the deepspeed config file
+B = ds_config['train_micro_batch_size_per_gpu'] # full batch size
+T = ds_config['block_size'] # context length/ block size
+grad_accum_steps = ds_config['gradient_accumulation_steps']
+
+# data loader portion for training with deepspeed
+from data_loader_fw import DataLoaderLite
+
+train_loader = DataLoaderLite(batch_size=B, block_size=T, split='train', process_rank=ddp_rank, process_world_size=ddp_world_size)
+val_loader = DataLoaderLite(batch_size=B, block_size=T, split='val', process_rank=ddp_rank, process_world_size=ddp_world_size)
+
+def tain_iter():
+    for _ in range(grad_accum_steps):
+        # get the next batch of data
+        x, y = train_loader.next_batch()
+        x = x.to(device)
+        y = y.to(device)
+        # yield the batch for the pipeline module to process
+        yield x, y
+
+def val_iter():
+    yield train_loader.next_batch()
+
 
 model_engine.train()  # set the model to training mode
 import time
@@ -241,11 +268,11 @@ for step in range(max_steps):
     # model_engine.step()
 
     # print training loss every 100 steps
-    if step % 100 == 0 and local_rank == 0:
+    if step % 100 == 0 and global_rank == 0:
         print(f"Step {step}: Training loss: {loss.item():.4f}")
 
     # validate every 1000 steps
-    # if step % 100 == 0 and local_rank == 0:
+    # if step % 100 == 0 and global_rank == 0:
         # calculate_val_loss(model_engine, step, val_loader, val_loss_step=20, device=device)
 
     t1 = time.time()
@@ -253,9 +280,10 @@ for step in range(max_steps):
     tokens_processed = (B * T) * grad_accum_steps * ddp_world_size
     tokens_per_second = (tokens_processed / dt)*1000 # tokens per second, because dt is in milliseconds
 
-    if local_rank == 0:
+    if global_rank == 0:
         curr_loss = loss.item()
         curr_lr = model_engine.get_lr()[0]
         # you cannot get the global gradient norm directly from the model engine
         # grad_norm = model_engine.get_gradient_norm()
         print(f"Step {step} | loss: {loss.item():.6f} | lr:{curr_lr:0.4e} | dt {dt:.2f}ms | {tokens_per_second:.2f} tokens/sec")
+    

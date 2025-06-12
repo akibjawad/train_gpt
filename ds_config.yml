@@ -38,8 +38,5 @@ zero_optimization:
 
 gradient_clipping: 1.0
 
-pipeline:
-  enabled: true
-
 # for time breakdown profiling
 # wall_clock_breakdown: true

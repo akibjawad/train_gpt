@@ -58,6 +58,11 @@ local_rank = int(os.environ['LOCAL_RANK'])
 torch.cuda.set_device(local_rank)
 device = f'cuda:{local_rank}'
 
+print(f"[Rank {local_rank}] NCCL_DEBUG={os.environ.get('NCCL_DEBUG')}")
+print(f"[Rank {local_rank}] NCCL_SOCKET_IFNAME={os.environ.get('NCCL_SOCKET_IFNAME')}")
+print(f"[Rank {local_rank}] MASTER_ADDR={os.environ.get('MASTER_ADDR')}")
+print(f"[Rank {local_rank}] MASTER_PORT={os.environ.get('MASTER_PORT')}")
+
 # seed
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -233,7 +238,7 @@ from data_loader_fw import DataLoaderLite
 train_loader = DataLoaderLite(batch_size=B, block_size=T, split='train', process_rank=ddp_rank, process_world_size=ddp_world_size)
 val_loader = DataLoaderLite(batch_size=B, block_size=T, split='val', process_rank=ddp_rank, process_world_size=ddp_world_size)
 
-def tain_iter(device):
+def train_iter(device):
     for _ in range(grad_accum_steps):
         # get the next batch of data
         x, y = train_loader.next_batch()
@@ -253,12 +258,18 @@ for step in range(max_steps):
 
     # forward pass & backward pass & gradient accumulation & optimizer step
     # in pipeline parallelism, we need to call train_batch
-    model_engine.train_batch(data_iter=tain_iter(device)),
+    print(f"[Rank {local_rank}] Running train_batch at step {step}")
+    # if model_engine.is_first_stage():
+    #     data_iterator = train_iter(device)
+    # else:
+    #     data_iterator = None
+
+    model_engine.train_batch(data_iter=train_iter(device))
     loss = model_engine.loss
 
     # calcuate eval loss on every eval_steps
-    if local_rank==0 and step % args.eval_steps == 0 and step > 0:
-        calculate_val_loss_fw(model_engine, step, val_loader, val_loss_step=20, device=device)
+    # if step % args.eval_steps == 0 and step > 0:
+        # calculate_val_loss_fw(model_engine, step, val_loader, val_loss_step=20, device=device)
     
     t1 = time.time()
     dt = (t1 - t0)*1000

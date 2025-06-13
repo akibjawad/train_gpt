@@ -8,12 +8,15 @@ block_size: 1024
 train_batch_size: 512
 
 # micro batch size: This is the batch size per forward/backward pass on each device (GPU)
-train_micro_batch_size_per_gpu: 8
+train_micro_batch_size_per_gpu: 16
 
 # Running on 2 (data parallel size) gpus
 # number of steps to accumulate gradients before performing an optimizer step
 # gradient accumulation steps of 4
-gradient_accumulation_steps: 64
+gradient_accumulation_steps: 16
+
+pipeline:
+    enabled: true
 
 # total_batch_size = micro_batch_size * gradient_accumulation_steps * number_of_gpus
 

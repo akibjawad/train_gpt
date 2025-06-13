@@ -48,7 +48,7 @@ def write_datafile(filename, data):
 # each shard is set to shard_size 100M tokens
 # last shard may be smaller
 
-nprocs = max(1, os.cpu_count()-2)  # use 1/2 cores for other tasks
+nprocs = max(1, os.cpu_count()-1)  # use 1/2 cores for other tasks
 progress_bar = None
 
 with mp.Pool(processes=nprocs) as pool:

@@ -1,46 +1,44 @@
 # defining argument parser
 import os
 import argparse
+import deepspeed
 def parse_args():
     parser = argparse.ArgumentParser(description="GPT Training with DeepSpeed")
+    parser = deepspeed.add_config_arguments(parser) # adding deepspeed config arguments
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
-    parser.add_argument('--deepspeed', action='store_true', help='Use DeepSpeed')
-    parser.add_argument('--deepspeed_config', type=str, default='ds_config.yml', help='Path to DeepSpeed config file')
     parser.add_argument('--block_size', type=int, default=1024, help='Context length / block size')
     parser.add_argument('--pipeline_parallel_size', type=int, default=1, help='Pipeline parallel size')
+    parser.add_argument('--eval_steps', type=int, default=250, help='Number of steps to evaluate the model')
     args = parser.parse_args()
     return args
 
-# validation loss calculation
-def calculate_val_loss(model_engine, curr_step, val_loader, val_loss_step, device):
+def val_iter(device):
+    for _ in range(grad_accum_steps):
+        # get the next batch of data
+        x, y = val_loader.next_batch()
+        x = x.to(device)
+        y = y.to(device)
+        # yield the batch for the pipeline module to process
+        yield x, y
+# validation loss calculation on fineweb dataset
+def calculate_val_loss_fw(model_engine, curr_step, val_loader, val_loss_step, device):
     model_engine.eval() # set the model to evaluation mode
     # evaluate the model on the validation set
     val_loader.reset() # reset the validation loader to the beginning of the first shard
     with torch.no_grad():
-        val_loss_accum = 0.0
-        val_loss_step = 20 # how many steps to accumulate the validation loss
+        total_val_loss = 0.0
         for _ in range(val_loss_step):
-            x, y = val_loader.next_batch()
-            x = x.to(device)
-            y = y.to(device)
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                # parameters are still in float32 but logits are in bfloat16
-                # only the matrix multiplications are in bfloat16
-                # softmax, loss, and other operations are in float32
-                _, loss = model_engine(x, y)
-            loss = loss/val_loss_step # scale the loss by the number of accumulation steps
-            val_loss_accum += loss.detach() # accumulate the loss
-        # if we are using DDP, we need to synchronize the gradients across all processes
-        # this is done automatically by DDP when we call loss.backward()
-        # but we don't want to do this until we have done all the accumulation steps
-        # all_reduce across data-parallel groups only
-        dist.all_reduce(val_loss_accum, op=deepspeed.comm.ReduceOp.AVG)
-        if dist.get_rank() == 0:
-            print(f"Validation loss at step {curr_step}: {val_loss_accum.item():.4f}")
-            # with open(log_file, 'a') as f:
-            #     f.write(f"step {step}: val {val_loss_accum.item():.4f}\n")
-        model_engine.train() # set the model back to training mode
+            model_engine.eval_batch(data_iter=val_iter(device)) # evaluate the model on the validation set
+            loss = model_engine.loss
+            total_val_loss += loss.detach()
+        avg_loss = total_val_loss / val_loss_step
+        print(f"Validation loss at step {curr_step}: {avg_loss:.4f}")
+        # with open(log_file, 'a') as f:
+        #     f.write(f"step {step}: val {val_loss_accum.item():.4f}\n")
+    model_engine.train() # set the model back to training mode
+
+
 
 # script will run on all gpus
 args = parse_args()
@@ -56,9 +54,9 @@ else:
 import torch
 assert torch.cuda.is_available(), "CUDA is not available, but Deepspeed requires it"
 
-global_rank = int(os.environ['RANK'])
-device = f'cuda:{global_rank}'
-torch.cuda.set_device(device)
+local_rank = int(os.environ['LOCAL_RANK'])
+torch.cuda.set_device(local_rank)
+device = f'cuda:{local_rank}'
 
 # seed
 torch.manual_seed(1337)
@@ -74,7 +72,6 @@ num_dp = global_world_size // num_pp
 
 print(f'setting up pipeline parallelism with {num_pp} pipeline parallel groups and {num_dp} data parallel groups')
 
-import deepspeed
 # initializing distributed
 deepspeed.init_distributed()
 
@@ -236,7 +233,7 @@ from data_loader_fw import DataLoaderLite
 train_loader = DataLoaderLite(batch_size=B, block_size=T, split='train', process_rank=ddp_rank, process_world_size=ddp_world_size)
 val_loader = DataLoaderLite(batch_size=B, block_size=T, split='val', process_rank=ddp_rank, process_world_size=ddp_world_size)
 
-def tain_iter():
+def tain_iter(device):
     for _ in range(grad_accum_steps):
         # get the next batch of data
         x, y = train_loader.next_batch()
@@ -244,9 +241,6 @@ def tain_iter():
         y = y.to(device)
         # yield the batch for the pipeline module to process
         yield x, y
-
-def val_iter():
-    yield train_loader.next_batch()
 
 
 model_engine.train()  # set the model to training mode
@@ -259,28 +253,19 @@ for step in range(max_steps):
 
     # forward pass & backward pass & gradient accumulation & optimizer step
     # in pipeline parallelism, we need to call train_batch
-    model_engine.train_batch(data_iter=tain_iter()),
-
-    # backward pass
+    model_engine.train_batch(data_iter=tain_iter(device)),
     loss = model_engine.loss
 
-    # step the optimizer
-    # model_engine.step()
-
-    # print training loss every 100 steps
-    if step % 100 == 0 and global_rank == 0:
-        print(f"Step {step}: Training loss: {loss.item():.4f}")
-
-    # validate every 1000 steps
-    # if step % 100 == 0 and global_rank == 0:
-        # calculate_val_loss(model_engine, step, val_loader, val_loss_step=20, device=device)
-
+    # calcuate eval loss on every eval_steps
+    if local_rank==0 and step % args.eval_steps == 0 and step > 0:
+        calculate_val_loss_fw(model_engine, step, val_loader, val_loss_step=20, device=device)
+    
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_processed = (B * T) * grad_accum_steps * ddp_world_size
     tokens_per_second = (tokens_processed / dt)*1000 # tokens per second, because dt is in milliseconds
 
-    if global_rank == 0:
+    if local_rank == 0:
         curr_loss = loss.item()
         curr_lr = model_engine.get_lr()[0]
         # you cannot get the global gradient norm directly from the model engine

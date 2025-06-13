@@ -21,8 +21,6 @@ gradient_accumulation_steps: 64
 
 # schduler is also configured manually in the training script
 
-steps_per_print: 100
-
 # loss scaling is used to prevent overflow of gradients
 bf16:
     enabled: true
